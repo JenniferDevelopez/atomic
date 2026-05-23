@@ -34,10 +34,14 @@ use regex::Regex;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 
-/// Default cap on tool-calling iterations. Reports can opt up via the
+/// Default cap on tool-calling iterations. Reports can override via the
 /// `max_tool_iterations` column; the cap exists so a runaway agent
-/// burning tool calls cannot melt down the LLM budget unbounded.
-const DEFAULT_MAX_ITERATIONS: usize = 10;
+/// burning tool calls can't melt down the LLM budget unbounded, but it
+/// needs enough headroom that a thorough investigation (5-10 searches
+/// + read_atom paging across multiple long atoms) doesn't get cut off
+/// mid-research. 50 is the floor of "comfortable" — a normal daily
+/// briefing finishes in <10, contradiction scans typically take 15-25.
+const DEFAULT_MAX_ITERATIONS: usize = 50;
 /// Inline snippet length used in prompt construction and tool responses.
 const SNIPPET_LEN: usize = 200;
 /// Excerpt length stored in `report_finding_citations.excerpt` — slightly
