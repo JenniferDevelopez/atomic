@@ -3,9 +3,12 @@
 //!
 //! `seed_default_briefing_report` and `migrate_briefings_to_findings` run at
 //! `atomic-server` startup, before the HTTP listener binds. Both are
-//! idempotent — `seed` is keyed on `dashboard.featured_report_id` pointing
-//! at an extant report, `migrate` on a per-DB settings flag — so multiple
-//! starts are safe.
+//! idempotent — `seed` is keyed on the `reports.default_briefing_seeded`
+//! flag, `migrate` on `briefings.migrated_to_findings` — so multiple starts
+//! are safe. The seed's flag is set only after the first successful create
+//! (or after detecting a pre-flag DB whose featured pointer already
+//! references a real report), which means once the user clears the featured
+//! pointer or deletes the seeded report, those choices survive reboots.
 //!
 //! The phase-3 plan (`docs/plans/reports-phase-3-briefing-collapse.md`) gates
 //! the briefing teardown on these two helpers running end-to-end. The legacy
@@ -36,6 +39,14 @@ const BRIEFINGS_TAG: &str = "Briefings";
 use crate::FEATURED_REPORT_SETTING;
 
 const MIGRATION_FLAG_SETTING: &str = "briefings.migrated_to_findings";
+
+/// One-shot flag set after `seed_default_briefing_report` has run
+/// successfully once per DB. The earlier idempotency check (featured
+/// pointer exists + report it points at exists) silently re-seeded if
+/// the user cleared the pointer or deleted the seeded report — both
+/// legitimate user actions that we should respect, not undo on next
+/// boot. This flag is the authoritative "we've done this dance" mark.
+const SEED_FLAG_SETTING: &str = "reports.default_briefing_seeded";
 
 const LEGACY_FREQUENCY_KEY: &str = "task.daily_briefing.frequency";
 const LEGACY_TIME_KEY: &str = "task.daily_briefing.time";
@@ -68,15 +79,35 @@ pub struct LegacyBriefingCitation {
 /// stamps `Reports/Briefings`, points the dashboard at it, and clears the
 /// legacy prompt key so the report row is the new source of truth.
 ///
-/// Idempotency: if `dashboard.featured_report_id` is set and the report it
-/// references still exists, the function returns immediately. A stale
-/// pointer (set to a deleted report) falls through and re-seeds.
+/// Idempotency: anchored on the `reports.default_briefing_seeded` flag. The
+/// flag is set after the first successful seed; subsequent boots see it set
+/// and exit immediately, *regardless* of whether the user has since cleared
+/// the featured pointer or deleted the seeded report. Both are legitimate
+/// user actions that we don't want to undo.
+///
+/// One-time migration: DBs from before this flag existed have a featured
+/// pointer pointing at a real report from the original seed. We detect that
+/// case here and set the flag without re-seeding — so the flag-based
+/// idempotency takes over from then on.
 pub async fn seed_default_briefing_report(core: &AtomicCore) -> Result<(), AtomicCoreError> {
     let storage = core.storage();
     let settings = storage.get_all_settings_sync().await?;
 
+    // Primary idempotency check: the explicit one-shot flag.
+    if matches!(
+        settings.get(SEED_FLAG_SETTING).map(|s| s.as_str()),
+        Some("true")
+    ) {
+        return Ok(());
+    }
+
+    // One-time migration: DBs seeded before this flag existed have a
+    // featured pointer pointing at a real report. Mark them done without
+    // re-seeding. From then on the flag-based check above handles
+    // idempotency.
     if let Some(existing_id) = settings.get(FEATURED_REPORT_SETTING) {
         if !existing_id.is_empty() && core.get_report(existing_id).await?.is_some() {
+            storage.set_setting_sync(SEED_FLAG_SETTING, "true").await?;
             return Ok(());
         }
     }
@@ -127,6 +158,11 @@ pub async fn seed_default_briefing_report(core: &AtomicCore) -> Result<(), Atomi
     storage
         .set_setting_sync(FEATURED_REPORT_SETTING, &report.id)
         .await?;
+
+    // Mark the seed as done. Anything after this point that tears down
+    // the seeded report or clears the featured pointer is user-driven
+    // and must not be undone on next boot.
+    storage.set_setting_sync(SEED_FLAG_SETTING, "true").await?;
 
     // The seeded report is the new source of truth for the prompt; clearing
     // the legacy key avoids drift across edits to the report row.

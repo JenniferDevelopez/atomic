@@ -55,8 +55,26 @@ function emit(preset: Preset, hour: number, minute: number, weekday: number, cus
     case 'weekdays': return `0 ${minute} ${hour} * * 1-5`;
     case 'weekly':   return `0 ${minute} ${hour} * * ${weekday}`;
     case 'hourly':   return `0 0 * * * *`;
-    case 'custom':   return custom;
+    case 'custom':   return normalizeCustomCron(custom);
   }
+}
+
+/// Normalize a custom-cron string to the 6-field shape the backend's
+/// `cron` crate accepts. Standard 5-field cron (`MIN HOUR DOM MONTH
+/// DOW`) gets a leading `0 ` so the seconds field is explicit — this
+/// is the most common copy-paste shape users bring in from POSIX-cron
+/// references. 6-field input passes through unchanged. Everything
+/// else (whitespace-only, garbage) also passes through; the
+/// always-visible cron preview + the live-validation marker flag
+/// invalid input either way.
+function normalizeCustomCron(expr: string): string {
+  const trimmed = expr.trim();
+  if (!trimmed) return trimmed;
+  const parts = trimmed.split(/\s+/);
+  if (parts.length === 5) {
+    return `0 ${parts.join(' ')}`;
+  }
+  return trimmed;
 }
 
 /// Minimal cron validator. Accepts 5- or 6-field expressions and

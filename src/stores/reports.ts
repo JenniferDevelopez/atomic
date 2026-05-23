@@ -211,10 +211,20 @@ interface ReportsStore {
   /// optimistic state if neither resolves.
   runningReportIds: Set<string>;
 
-  /// Wall-clock dispatch timestamps per report, epoch ms. Used by the
-  /// failure poll to decide whether a stamped `last_run_at` belongs to
-  /// the run we just dispatched vs. an earlier one.
+  /// Wall-clock dispatch timestamps per report, epoch ms. The detail
+  /// view's stale-guard timeout reads this to decide when to give up.
   runDispatchedAt: Record<string, number>;
+
+  /// Snapshot of `report.last_error` at dispatch time. The runner
+  /// intentionally does *not* update `last_run_at` on failure (a
+  /// first-run failure would otherwise stamp an unparseable value
+  /// into the schedule anchor), so we can't use the timestamp to tell
+  /// our dispatch's failure apart from an earlier one. Instead the
+  /// detail view's failure poll compares the freshly-fetched
+  /// `last_error` against this snapshot: a value that has changed
+  /// (especially: was null, now set) means a new failure outcome was
+  /// just recorded.
+  lastErrorAtDispatch: Record<string, string | null>;
 
   isLoadingList: boolean;
   loadError: string | null;
@@ -225,6 +235,16 @@ interface ReportsStore {
 
   fetchAll: () => Promise<void>;
   fetchLastFinding: (reportId: string) => Promise<void>;
+
+  /// Wire up the live-refresh `atom-created` subscription if it isn't
+  /// already. Safe to call from any consumer that needs running-state
+  /// to clear on completion (list view, detail view). Idempotent —
+  /// subsequent calls no-op via the `hasSubscription` guard.
+  ///
+  /// Lives separately from `fetchAll` so a direct deep-link to
+  /// `/reports/:id` (which bypasses the list view entirely) still
+  /// observes scheduled and manual run completions.
+  ensureSubscription: () => void;
 
   /// Fetch a single report by id and merge it into the store. Used by
   /// the detail view on cold-start deep links when the list hasn't
@@ -282,11 +302,6 @@ interface ReportsStore {
 }
 
 export const useReportsStore = create<ReportsStore>((set, get) => {
-  // Module-scope handle for the atom-created unsubscribe so `reset()` can
-  // tear it down. Captured in closure rather than store state because it
-  // isn't render-relevant.
-  let atomCreatedUnsub: (() => void) | null = null;
-
   return {
     reports: [],
     byId: {},
@@ -295,6 +310,7 @@ export const useReportsStore = create<ReportsStore>((set, get) => {
     citationCountsByAtomId: {},
     runningReportIds: new Set<string>(),
     runDispatchedAt: {},
+    lastErrorAtDispatch: {},
     isLoadingList: false,
     loadError: null,
     hasSubscription: false,
@@ -311,54 +327,6 @@ export const useReportsStore = create<ReportsStore>((set, get) => {
         // parallel; failures degrade to "no excerpt available" without
         // surfacing per-report toasts.
         await Promise.all(reports.map(r => get().fetchLastFinding(r.id)));
-
-        // Wire the live-refresh subscription once. The dashboard
-        // BriefingWidget uses the same shape: AtomWithTags flattens, so
-        // `kind` lives at the payload top level. When a report finding
-        // lands we:
-        //   1. Re-prime last-finding for every loaded report (the list
-        //      view's italic excerpt + the detail view's findings cache)
-        //   2. Refetch each running report's findings, then check which
-        //      report's most-recent finding matches the new atom id.
-        //      That's the run we completed — clear its running state.
-        if (!get().hasSubscription) {
-          atomCreatedUnsub = getTransport().subscribe('atom-created', async (payload) => {
-            const p = payload as { kind?: string; id?: string } | undefined;
-            if (p?.kind !== 'report') return;
-            const newAtomId = p.id;
-
-            const state = get();
-            const allIds = Object.keys(state.byId);
-            const runningIds = Array.from(state.runningReportIds);
-
-            // Re-prime the list view's last-finding cache + every
-            // running report's full findings cache. Running reports
-            // are a strict subset of allIds, so we issue findings
-            // requests for them and last-finding requests for the rest.
-            const runningSet = new Set(runningIds);
-            const lastFindingPromises = allIds
-              .filter(id => !runningSet.has(id))
-              .map(id => state.fetchLastFinding(id));
-            const findingsPromises = runningIds.map(id => state.fetchFindings(id));
-            await Promise.all([...lastFindingPromises, ...findingsPromises]);
-
-            // After cache rehydration, clear any running report whose
-            // most-recent finding matches the new atom id.
-            if (newAtomId) {
-              const after = get();
-              for (const id of runningIds) {
-                const first = after.findingsByReport[id]?.[0];
-                if (first && first.atom.id === newAtomId) {
-                  get().clearRunning(id);
-                  toast.success('New finding', {
-                    description: after.byId[id]?.name,
-                  });
-                }
-              }
-            }
-          });
-          set({ hasSubscription: true });
-        }
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         set({ isLoadingList: false, loadError: msg });
@@ -366,16 +334,65 @@ export const useReportsStore = create<ReportsStore>((set, get) => {
       }
     },
 
+    ensureSubscription: () => {
+      // Idempotent — subsequent calls take the fast-path. The
+      // subscription's payload contract (AtomCreated with flattened
+      // AtomWithTags fields including `kind`) matches what the
+      // dashboard widget already consumes.
+      if (get().hasSubscription) return;
+      getTransport().subscribe('atom-created', async (payload) => {
+        const p = payload as { kind?: string; id?: string } | undefined;
+        if (p?.kind !== 'report') return;
+        const newAtomId = p.id;
+
+        const state = get();
+        const allIds = Object.keys(state.byId);
+        const runningIds = Array.from(state.runningReportIds);
+
+        // Re-prime the list view's last-finding cache + every running
+        // report's full findings cache. Running reports are a strict
+        // subset of allIds, so we issue findings requests for them and
+        // last-finding requests for the rest.
+        const runningSet = new Set(runningIds);
+        const lastFindingPromises = allIds
+          .filter(id => !runningSet.has(id))
+          .map(id => state.fetchLastFinding(id));
+        const findingsPromises = runningIds.map(id => state.fetchFindings(id));
+        await Promise.all([...lastFindingPromises, ...findingsPromises]);
+
+        // After cache rehydration, clear any running report whose
+        // most-recent finding matches the new atom id.
+        if (newAtomId) {
+          const after = get();
+          for (const id of runningIds) {
+            const first = after.findingsByReport[id]?.[0];
+            if (first && first.atom.id === newAtomId) {
+              get().clearRunning(id);
+              toast.success('New finding', {
+                description: after.byId[id]?.name,
+              });
+            }
+          }
+        }
+      });
+      set({ hasSubscription: true });
+    },
+
     runNow: async (reportId: string) => {
       // Optimistically mark running before the dispatch lands, so the
       // button disables instantly. Even if dispatch fails we revert.
       const dispatchedAt = Date.now();
+      const lastErrorSnapshot = get().byId[reportId]?.last_error ?? null;
       set(state => {
         const next = new Set(state.runningReportIds);
         next.add(reportId);
         return {
           runningReportIds: next,
           runDispatchedAt: { ...state.runDispatchedAt, [reportId]: dispatchedAt },
+          lastErrorAtDispatch: {
+            ...state.lastErrorAtDispatch,
+            [reportId]: lastErrorSnapshot,
+          },
         };
       });
       try {
@@ -397,8 +414,13 @@ export const useReportsStore = create<ReportsStore>((set, get) => {
         if (!state.runningReportIds.has(reportId)) return state;
         const next = new Set(state.runningReportIds);
         next.delete(reportId);
-        const { [reportId]: _omit, ...restDispatched } = state.runDispatchedAt;
-        return { runningReportIds: next, runDispatchedAt: restDispatched };
+        const { [reportId]: _omitDispatch, ...restDispatched } = state.runDispatchedAt;
+        const { [reportId]: _omitError, ...restErrors } = state.lastErrorAtDispatch;
+        return {
+          runningReportIds: next,
+          runDispatchedAt: restDispatched,
+          lastErrorAtDispatch: restErrors,
+        };
       });
     },
 
@@ -588,8 +610,12 @@ export const useReportsStore = create<ReportsStore>((set, get) => {
     },
 
     reset: () => {
-      atomCreatedUnsub?.();
-      atomCreatedUnsub = null;
+      // Note: the `atom-created` subscription is intentionally *not*
+      // torn down here. It's session-scoped infrastructure — needed
+      // by both the list view and the detail view, set up once via
+      // `ensureSubscription`, and not safe to drop just because one
+      // view unmounted (the other still depends on it). The data
+      // caches reset; the subscription survives.
       set({
         reports: [],
         byId: {},
@@ -598,9 +624,10 @@ export const useReportsStore = create<ReportsStore>((set, get) => {
         citationCountsByAtomId: {},
         runningReportIds: new Set<string>(),
         runDispatchedAt: {},
+        lastErrorAtDispatch: {},
         isLoadingList: false,
         loadError: null,
-        hasSubscription: false,
+        // `hasSubscription` is intentionally not reset — see above.
       });
     },
   };

@@ -7544,6 +7544,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn seed_does_not_recreate_after_user_clears_featured_pointer() {
+        // Reproduces the P2 review bug: previously, the idempotency check
+        // was anchored on `dashboard.featured_report_id` existing. Clearing
+        // the pointer (a legitimate user action) caused the next seed call
+        // to create a duplicate Daily Briefing.
+        let (db, _temp) = create_test_db().await;
+        seed_default_briefing_report(&db).await.unwrap();
+        let initial = db.list_reports().await.unwrap();
+        assert_eq!(initial.len(), 1);
+
+        // User clears the featured pointer (or deletes the featured
+        // report). The seed flag is still set; subsequent seed call
+        // must respect it.
+        db.set_featured_report_id(None).await.unwrap();
+
+        seed_default_briefing_report(&db).await.unwrap();
+        let after = db.list_reports().await.unwrap();
+        assert_eq!(
+            after.len(),
+            1,
+            "no duplicate after user clears the featured pointer"
+        );
+        // Pointer stays cleared — the seed must not silently re-feature.
+        assert_eq!(db.get_featured_report_id().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn seed_does_not_recreate_after_user_deletes_seeded_report() {
+        // Companion case to the above: if the user explicitly deletes the
+        // seeded report (which auto-clears the featured pointer), the
+        // next seed call must not bring it back.
+        let (db, _temp) = create_test_db().await;
+        seed_default_briefing_report(&db).await.unwrap();
+        let r = &db.list_reports().await.unwrap()[0];
+        let id = r.id.clone();
+
+        db.delete_report(&id).await.unwrap();
+        assert_eq!(db.list_reports().await.unwrap().len(), 0);
+
+        seed_default_briefing_report(&db).await.unwrap();
+        assert_eq!(
+            db.list_reports().await.unwrap().len(),
+            0,
+            "deleted seed stays deleted across reboots"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_migrates_pre_flag_dbs_without_reseeding() {
+        // For DBs seeded before the `default_briefing_seeded` flag existed,
+        // the featured pointer is the only signal that seeding has
+        // happened. The seed function detects this on first run, marks the
+        // flag, and returns without creating a duplicate.
+        let (db, _temp) = create_test_db().await;
+        seed_default_briefing_report(&db).await.unwrap();
+        let initial_id = db.list_reports().await.unwrap()[0].id.clone();
+
+        // Simulate the pre-flag world by removing the flag (the report
+        // and the featured pointer both still exist).
+        db.storage
+            .delete_setting_sync("reports.default_briefing_seeded")
+            .await
+            .unwrap();
+
+        seed_default_briefing_report(&db).await.unwrap();
+        let after = db.list_reports().await.unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].id, initial_id, "same row, not replaced");
+
+        // And the flag is now set so subsequent boots take the fast path.
+        let flag = db
+            .storage
+            .get_setting_sync("reports.default_briefing_seeded")
+            .await
+            .unwrap();
+        assert_eq!(flag.as_deref(), Some("true"));
+    }
+
+    #[tokio::test]
     async fn seed_pulls_research_prompt_from_briefing_prompt_setting() {
         let (db, _temp) = create_test_db().await;
         briefing_settings_with(&db, &[("briefing_prompt", "look for tensions")]).await;

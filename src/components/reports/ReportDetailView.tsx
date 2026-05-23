@@ -42,11 +42,13 @@ export function ReportDetailView({ reportId }: ReportDetailViewProps) {
   const findings = useReportsStore(s => s.findingsByReport[reportId]);
   const isRunning = useReportsStore(s => s.runningReportIds.has(reportId));
   const dispatchedAt = useReportsStore(s => s.runDispatchedAt[reportId]);
+  const lastErrorAtDispatch = useReportsStore(s => s.lastErrorAtDispatch[reportId]);
   const fetchOne = useReportsStore(s => s.fetchOne);
   const fetchFindings = useReportsStore(s => s.fetchFindings);
   const runNow = useReportsStore(s => s.runNow);
   const clearRunning = useReportsStore(s => s.clearRunning);
   const deleteReport = useReportsStore(s => s.delete);
+  const ensureSubscription = useReportsStore(s => s.ensureSubscription);
   const closeReportDetail = useUIStore(s => s.closeReportDetail);
   const openReader = useUIStore(s => s.openReader);
 
@@ -87,27 +89,39 @@ export function ReportDetailView({ reportId }: ReportDetailViewProps) {
     fetchFindings(reportId);
   }, [reportId, fetchFindings]);
 
+  // Make sure the atom-created subscription is wired even on cold
+  // deep-links to /reports/:id that bypass the list view. Idempotent
+  // — the store guards against double-subscription.
+  useEffect(() => {
+    ensureSubscription();
+  }, [ensureSubscription]);
+
   // Failure-detection poll. Only runs while the detail view is open
   // AND the report is in the running set — at most one report at any
-  // time, so this is cheap. We compare `last_run_at` to dispatchedAt:
-  // if the server stamped a run after our dispatch and recorded an
-  // error, the run failed.
+  // time, so this is cheap.
+  //
+  // We can't use `last_run_at` to identify our dispatch's failure: the
+  // runner intentionally does not update that column on failure (a
+  // first-run failure would otherwise stamp an unparseable value into
+  // the schedule anchor and silently wedge the report). Instead we
+  // snapshot `last_error` at dispatch time and compare on each poll —
+  // a value that has changed (especially: null → set) means a new
+  // failure outcome was recorded by either our dispatch or a
+  // concurrent scheduled tick. Either way the user gets the failure
+  // surfaced, which is the desired UX.
   useEffect(() => {
     if (!isRunning || !dispatchedAt) return;
     let cancelled = false;
     const interval = window.setInterval(async () => {
       const fresh = await fetchOne(reportId);
       if (cancelled || !fresh) return;
-      if (fresh.last_error && fresh.last_run_at) {
-        const stampedAt = new Date(fresh.last_run_at).getTime();
-        if (!Number.isNaN(stampedAt) && stampedAt >= dispatchedAt) {
-          clearRunning(reportId);
-          toast.error('Run failed', { description: fresh.last_error });
-        }
+      if (fresh.last_error && fresh.last_error !== lastErrorAtDispatch) {
+        clearRunning(reportId);
+        toast.error('Run failed', { description: fresh.last_error });
       }
     }, FAILURE_POLL_MS);
     return () => { cancelled = true; window.clearInterval(interval); };
-  }, [isRunning, dispatchedAt, reportId, fetchOne, clearRunning]);
+  }, [isRunning, dispatchedAt, reportId, fetchOne, clearRunning, lastErrorAtDispatch]);
 
   // Stale guard. If neither the AtomCreated event nor the failure
   // poll resolves the running state within 5 minutes, clear it. Long

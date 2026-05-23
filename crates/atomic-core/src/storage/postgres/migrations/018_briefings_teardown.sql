@@ -1,6 +1,11 @@
--- V22 marker. The briefings → finding-atom data migration and the subsequent
+-- V18 marker. The briefings → finding-atom data migration and the subsequent
 -- DROP of `briefings` / `briefing_citations` are owned by the Rust path
 -- (`crate::reports::seed::migrate_briefings_to_findings`), which runs at
 -- server startup with a per-DB idempotency flag. A pure SQL drop here would
 -- discard history before the Rust path could rehome it.
-SELECT 1;
+--
+-- The schema_version insert is still required even though the migration is a
+-- no-op: the migration runner reads `MAX(version) FROM schema_version` to
+-- decide what to run; without the row, this file re-executes on every boot
+-- and the reported schema version stays permanently at 17.
+INSERT INTO schema_version (version) VALUES (18);

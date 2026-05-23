@@ -23,6 +23,7 @@ export function ReportsFullView() {
   const reset = useReportsStore(s => s.reset);
   const setEnabled = useReportsStore(s => s.setEnabled);
   const deleteReport = useReportsStore(s => s.delete);
+  const ensureSubscription = useReportsStore(s => s.ensureSubscription);
   const openReportDetail = useUIStore(s => s.openReportDetail);
 
   const initializedRef = useRef(false);
@@ -30,7 +31,10 @@ export function ReportsFullView() {
     if (initializedRef.current) return;
     initializedRef.current = true;
     fetchAll();
-  }, [fetchAll]);
+    // Idempotent — also wired from ReportDetailView so deep-links
+    // observe completion events even without visiting the list first.
+    ensureSubscription();
+  }, [fetchAll, ensureSubscription]);
 
   useEffect(() => {
     return () => { reset(); };
