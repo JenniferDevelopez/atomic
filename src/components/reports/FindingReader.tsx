@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { ArrowLeft, Telescope } from 'lucide-react';
 import { toast } from 'sonner';
 import {
@@ -8,8 +8,11 @@ import {
   ReportFindingCitation,
 } from '../../stores/reports';
 import { useUIStore } from '../../stores/ui';
+import { useCanvasStore } from '../../stores/canvas';
+import { useIsMobile } from '../../hooks';
 import { BriefingContent } from '../dashboard/widgets/BriefingContent';
 import { CitationPopover, CitationForPopover } from '../wiki/CitationPopover';
+import { SigmaCanvas } from '../canvas/SigmaCanvas';
 import { formatRelativeDate } from '../../lib/date';
 
 interface FindingReaderProps {
@@ -55,6 +58,8 @@ export function FindingReader({ atomId }: FindingReaderProps) {
   const closeFindingReader = useUIStore(s => s.closeFindingReader);
   const openReportDetail = useUIStore(s => s.openReportDetail);
   const openReader = useUIStore(s => s.openReader);
+  const setViewMode = useUIStore(s => s.setViewMode);
+  const isMobile = useIsMobile();
 
   const [loaded, setLoaded] = useState<LoadedFinding | null>(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -128,6 +133,34 @@ export function FindingReader({ atomId }: FindingReaderProps) {
     excerpt: c.excerpt,
   }));
 
+  // Atom ids the mini-canvas scopes to: every distinct atom cited by
+  // this finding. The canvas adds 1-hop neighbors from the existing
+  // semantic-edge set so a single-citation finding still renders a
+  // meaningful neighborhood instead of one orphan node. Undefined
+  // until citations resolve so the canvas doesn't render a global
+  // graph during the load window.
+  const citedAtomIds = useMemo(() => {
+    if (!loaded || loaded.citations.length === 0) return undefined;
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const c of loaded.citations) {
+      if (seen.has(c.cited_atom_id)) continue;
+      seen.add(c.cited_atom_id);
+      out.push(c.cited_atom_id);
+    }
+    return out;
+  }, [loaded]);
+
+  // Clicking a node in the mini-canvas jumps to the full canvas
+  // focused on that atom. Same affordance as the dashboard widget —
+  // `setViewMode('canvas')` deactivates the active tab automatically.
+  const handleMiniNodeClick = (clickedAtomId: string) => {
+    const canvas = useCanvasStore.getState();
+    canvas.setPendingCamera(null);
+    canvas.setPendingFocusAtomId(clickedAtomId);
+    setViewMode('canvas');
+  };
+
   const handleCitationClick = (
     citation: { citation_index: number; atom_id: string; excerpt: string },
     element: HTMLElement,
@@ -195,9 +228,33 @@ export function FindingReader({ atomId }: FindingReaderProps) {
         </div>
       </div>
 
-      {/* Body — finding content with clickable citation markers. */}
+      {/* Body — finding content with clickable citation markers, plus
+          a mini-canvas of the cited atoms (and their 1-hop neighbors)
+          that doubles as a jump-into-canvas affordance. Desktop floats
+          the canvas right of the prose; mobile stacks it above so the
+          text isn't pushed into a narrow column. */}
       <div className="flex-1 overflow-y-auto">
         <div className="max-w-3xl mx-auto px-6 py-8">
+          {!isMobile && citedAtomIds && citedAtomIds.length > 0 && (
+            <div className="float-right ml-4 mb-4 w-80 aspect-[4/3]">
+              <SigmaCanvas
+                mode="preview"
+                filterAtomIds={citedAtomIds}
+                onPreviewNodeClick={handleMiniNodeClick}
+              />
+            </div>
+          )}
+
+          {isMobile && citedAtomIds && citedAtomIds.length > 0 && (
+            <div className="mb-4 w-full aspect-[16/10]">
+              <SigmaCanvas
+                mode="preview"
+                filterAtomIds={citedAtomIds}
+                onPreviewNodeClick={handleMiniNodeClick}
+              />
+            </div>
+          )}
+
           {loaded ? (
             <BriefingContent
               content={content}
@@ -217,6 +274,10 @@ export function FindingReader({ atomId }: FindingReaderProps) {
               Finding unavailable.
             </p>
           )}
+
+          {/* Clear the float so any subsequent UI sits below the canvas
+              rather than wrapping around it. */}
+          <div className="md:clear-right" />
         </div>
       </div>
 
