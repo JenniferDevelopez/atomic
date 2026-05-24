@@ -224,7 +224,23 @@ fn build_user_prompt(report: &Report, source: &[AtomWithTags], total_in_scope: i
     // user-authored) from having to re-state it. The system scaffold
     // carries the longer-form rules (no-invented-numbers,
     // source_and_context semantics); this is the inline reminder.
-    out.push_str("Cite source atoms with [N] inline markers using the bracketed numbers from the source list below.\n\n");
+    //
+    // Policy-aware. `source_only` is the strict case where only the
+    // source-list numbers are citable; the directive can be tight. For
+    // `source_and_context` we have to also mention search-assigned
+    // numbers — otherwise this very reminder contradicts the policy
+    // and tells the model to suppress citations it's explicitly
+    // configured to make. The two-line form is by design: the canonical
+    // policy statement still appears at the bottom of the user prompt
+    // (after the source list); this is the in-prompt nudge.
+    match report.citation_policy {
+        CitationPolicy::SourceOnly => {
+            out.push_str("Cite source atoms with [N] inline markers using the bracketed numbers from the source list below.\n\n");
+        }
+        CitationPolicy::SourceAndContext => {
+            out.push_str("Cite with [N] inline markers — numbers come from the source list below and from semantic_search results as they are surfaced.\n\n");
+        }
+    }
 
     if source.is_empty() {
         out.push_str("(no source atoms — this should be unreachable; the runner short-circuits empty scopes)\n");
