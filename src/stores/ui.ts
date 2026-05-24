@@ -443,21 +443,50 @@ export const useUIStore = create<UIStore>()(
           return;
         }
 
-        // Plain click from a base view: switch if a tab already shows this entry.
-        const existing = state.tabs.find((t) => {
-          const cur = t.stack[t.stackIndex];
-          return cur && entriesEquivalent(cur, entry);
-        });
+        // Plain click from a base view: switch if any tab has this entry
+        // anywhere in its stack. We walk the full stack rather than just
+        // `stack[stackIndex]` because the natural report→finding flow leaves
+        // the report entry at stack[0] while the user is viewing a finding
+        // at stack[1]; clicking the report again from the reports list
+        // would otherwise miss the dedup and spawn a duplicate tab. Same
+        // failure shape applies to any deep navigation (atom→related atom,
+        // wiki→atom-from-citation, etc.) — dedup against the full history
+        // matches the user intent of "I already had this open, take me there."
+        //
+        // When we find a match, we *jump* the existing tab's stackIndex to
+        // that entry's position. The forward-history past it is preserved
+        // and remains reachable via the chevron — same semantics as clicking
+        // a stack entry from within the tab.
+        //
+        // First match wins. If the same entry appears multiple times on one
+        // stack (rare — the in-tab push branch above does not currently
+        // dedup consecutive duplicates), we land on the earliest occurrence.
+        let existing: Tab | null = null;
+        let existingIndex = -1;
+        for (const t of state.tabs) {
+          const idx = t.stack.findIndex((e) => entriesEquivalent(e, entry));
+          if (idx !== -1) {
+            existing = t;
+            existingIndex = idx;
+            break;
+          }
+        }
         if (existing) {
+          const matched = existing.stack[existingIndex];
+          const existingId = existing.id;
           set((s) => {
-            const projected = projectActiveEntry(existing.stack[existing.stackIndex]);
+            const tabs = s.tabs.map((t) =>
+              t.id === existingId ? { ...t, stackIndex: existingIndex } : t,
+            );
+            const projected = projectActiveEntry(matched);
             return {
-              activeTabId: existing.id,
+              tabs,
+              activeTabId: existingId,
               ...projected,
               localGraph: { ...s.localGraph, ...projected.localGraphPatch },
             };
           });
-          navigateTo(entryUrl(existing.stack[existing.stackIndex]));
+          navigateTo(entryUrl(matched));
           return;
         }
 

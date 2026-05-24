@@ -39,9 +39,13 @@ use std::collections::{HashMap, HashSet};
 /// burning tool calls can't melt down the LLM budget unbounded, but it
 /// needs enough headroom that a thorough investigation (5-10 searches
 /// + read_atom paging across multiple long atoms) doesn't get cut off
-/// mid-research. 50 is the floor of "comfortable" — a normal daily
-/// briefing finishes in <10, contradiction scans typically take 15-25.
-const DEFAULT_MAX_ITERATIONS: usize = 50;
+/// mid-research. A normal daily briefing finishes in <10; contradiction
+/// scans typically take 15-25. 20 keeps the floor above the common case
+/// while bounding prompt growth before `final_pass` — every extra
+/// iteration appends tool-call + result messages, and once the prompt
+/// gets large enough the provider's per-completion budget shrinks,
+/// which surfaces as truncated findings.
+const DEFAULT_MAX_ITERATIONS: usize = 20;
 /// Inline snippet length used in prompt construction and tool responses.
 const SNIPPET_LEN: usize = 200;
 /// Excerpt length stored in `report_finding_citations.excerpt` — slightly
