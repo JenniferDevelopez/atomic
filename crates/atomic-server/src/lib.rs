@@ -36,6 +36,7 @@ pub use utoipa_scalar::{Scalar, Servable};
         routes::atoms::create_atom,
         routes::atoms::update_atom,
         routes::atoms::update_atom_content_only,
+        routes::atoms::add_tag_to_atom,
         routes::atoms::process_atom_pipeline,
         routes::atoms::delete_atom,
         routes::atoms::bulk_create_atoms,
@@ -211,6 +212,11 @@ pub use utoipa_scalar::{Scalar, Servable};
         atomic_core::KnowledgeSignalTarget,
         atomic_core::KnowledgeSignalProviderConfig,
         atomic_core::WikiCandidateEvidence,
+        atomic_core::WikiUpdateEvidence,
+        atomic_core::TagCleanupTagEvidence,
+        atomic_core::TagRedundancyEvidence,
+        atomic_core::EmptyTagEvidence,
+        atomic_core::MissingTagOverlapEvidence,
         // Canvas
         atomic_core::AtomPosition,
         atomic_core::AtomWithEmbedding,
@@ -247,6 +253,7 @@ pub use utoipa_scalar::{Scalar, Servable};
         // Server request types
         routes::atoms::CreateAtomRequest,
         routes::atoms::UpdateAtomRequest,
+        routes::atoms::AddTagToAtomRequest,
         routes::atoms::CreateTagRequest,
         routes::atoms::UpdateTagRequest,
         routes::atoms::SetAutotagTargetRequest,

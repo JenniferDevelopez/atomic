@@ -83,6 +83,12 @@ export const COMMAND_MAP: Record<string, CommandSpec> = {
     argsMode: 'body',
     transformArgs: atomBody,
   },
+  add_tag_to_atom: {
+    method: 'POST',
+    path: (a) => `/api/atoms/${encodeURIComponent(a.atomId as string)}/tags`,
+    argsMode: 'body',
+    transformArgs: (a) => ({ tag_id: a.tagId }),
+  },
   process_atom_pipeline: {
     method: 'POST',
     path: (a) => `/api/atoms/${encodeURIComponent(a.id as string)}/process`,
@@ -141,6 +147,15 @@ export const COMMAND_MAP: Record<string, CommandSpec> = {
   delete_tag: {
     method: 'DELETE',
     path: (a) => `/api/tags/${encodeURIComponent(a.id as string)}${a.recursive ? '?recursive=true' : ''}`,
+  },
+  merge_tags: {
+    method: 'POST',
+    path: '/api/tags/merge',
+    argsMode: 'body',
+    transformArgs: (a) => ({
+      source_tag_id: a.sourceTagId,
+      target_tag_id: a.targetTagId,
+    }),
   },
   set_tag_autotag_target: {
     method: 'PUT',
@@ -398,6 +413,7 @@ export const COMMAND_MAP: Record<string, CommandSpec> = {
       if (a.includeDismissed != null) params.set('include_dismissed', String(a.includeDismissed));
       if (a.includeSnoozed != null) params.set('include_snoozed', String(a.includeSnoozed));
       if (a.limit != null) params.set('limit', String(a.limit));
+      if (a.surface) params.set('surface', a.surface as string);
       return `/api/knowledge-signals${params.toString() ? `?${params}` : ''}`;
     },
   },

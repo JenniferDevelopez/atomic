@@ -47,6 +47,7 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
         "/atoms/{id}/content",
         web::put().to(atoms::update_atom_content_only),
     );
+    cfg.route("/atoms/{id}/tags", web::post().to(atoms::add_tag_to_atom));
     cfg.route(
         "/atoms/{id}/process",
         web::post().to(atoms::process_atom_pipeline),
@@ -77,6 +78,7 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
         "/tags/{id}/autotag-description",
         web::put().to(atoms::set_tag_autotag_description),
     );
+    cfg.route("/tags/merge", web::post().to(atoms::merge_tags));
     cfg.route("/tags/{id}", web::put().to(atoms::update_tag));
     cfg.route("/tags/{id}", web::delete().to(atoms::delete_tag));
 

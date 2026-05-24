@@ -1055,7 +1055,7 @@ impl Database {
                     ON knowledge_signal_feedback(target_type, target_id);
                 "#,
             )?;
-            conn.execute_batch("PRAGMA user_version = 23;")?;
+            conn.execute_batch(&format!("PRAGMA user_version = {};", Self::LATEST_VERSION))?;
         }
 
         // --- Triggers (recreated every startup to stay current) ---

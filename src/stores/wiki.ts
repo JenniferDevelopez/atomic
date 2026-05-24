@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { toast } from 'sonner';
 import { getTransport } from '../lib/transport';
+import type { KnowledgeSignal, WikiCandidateEvidence } from '../types/knowledgeSignals';
 
 // Types matching the Rust structs
 export interface WikiArticle {
@@ -70,34 +71,6 @@ export interface SuggestedArticle {
   reasons?: string[];
   source_count?: number;
   recent_count?: number;
-}
-
-interface KnowledgeSignal {
-  id: string;
-  provider_id: string;
-  target: {
-    kind: string;
-    id: string;
-    label: string;
-  };
-  score: number;
-  confidence: number;
-  reasons: Array<{
-    kind: string;
-    label: string;
-    value: unknown;
-    contribution: number;
-  }>;
-  evidence?: {
-    schema?: string;
-    schema_version?: number;
-    tag_id?: string;
-    tag_name?: string;
-    atom_count?: number;
-    mention_count?: number;
-    source_count?: number;
-    recent_count?: number;
-  };
 }
 
 export interface WikiVersionSummary {
@@ -253,7 +226,7 @@ export const useWikiStore = create<WikiStore>((set, get) => ({
   fetchSuggestedArticles: async () => {
     set({ isLoadingSuggestions: true });
     try {
-      const signals = await getTransport().invoke<KnowledgeSignal[]>('list_knowledge_signals', {
+      const signals = await getTransport().invoke<KnowledgeSignal<WikiCandidateEvidence>[]>('list_knowledge_signals', {
         providerId: 'wiki_candidate',
         limit: 100,
       });

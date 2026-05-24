@@ -3,6 +3,7 @@
 use crate::db_extractor::Db;
 use crate::error::ok_or_error;
 use actix_web::{web, HttpResponse};
+use chrono::Utc;
 use serde::Deserialize;
 use utoipa::IntoParams;
 
@@ -17,6 +18,8 @@ pub struct KnowledgeSignalsQuery {
     pub include_snoozed: Option<bool>,
     /// Max signals to return.
     pub limit: Option<i32>,
+    /// Optional rendering surface. `briefing` returns briefing-eligible signals.
+    pub surface: Option<String>,
 }
 
 #[utoipa::path(
@@ -31,6 +34,14 @@ pub async fn list_knowledge_signals(
     query: web::Query<KnowledgeSignalsQuery>,
 ) -> HttpResponse {
     let q = query.into_inner();
+    if q.surface.as_deref() == Some("briefing") {
+        let now = Utc::now();
+        return ok_or_error(
+            db.0.list_briefing_knowledge_signals(now, now, q.limit.unwrap_or(5))
+                .await,
+        );
+    }
+
     let filter = atomic_core::KnowledgeSignalFilter {
         provider_id: q.provider_id,
         include_dismissed: q.include_dismissed.unwrap_or(false),

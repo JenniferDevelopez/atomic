@@ -291,6 +291,53 @@ Suggested actions:
 
 V1 should start conservative: high-confidence sibling redundancy, empty tags, and clear near-duplicates. Broad/scattered tags and subsumption should have higher thresholds and more cautious wording.
 
+Actionability matters more than detection volume. A tag-cleanup signal should not ship as a row that only opens a tag and leaves the user to infer the next step. Every organization signal needs a concrete resolution path:
+
+- **Review evidence:** show exactly why Atomic thinks the tags overlap.
+- **Choose an outcome:** merge, delete, keep separate, or ignore this pair. Rename and move can be added later if those outcomes prove common enough.
+- **Preview impact:** show affected atoms, child tags, wiki articles, and tag assignments before mutation.
+- **Apply deliberately:** use existing tag mutation APIs where possible, and add explicit merge/apply routes instead of reusing the LLM-driven compact-tags utility.
+- **Record resolution:** dismiss/ignore signals durably so handled pairs do not reappear unchanged.
+
+For the first shippable slice, `review_overlap`, `keep_separate`, `merge_tags`, and `delete_empty_tag` are the useful outcomes. Merge is the primary action for true duplicate-tag signals, but it must be exposed through a deterministic preview and confirmation flow. The existing internal merge operation can be reused behind a new explicit action route, but the current one-click `compact_tags` route should not be the UI action for a deterministic signal because it lets an LLM choose and apply merges in one step.
+
+Initial implementation should split this module into shippable providers rather than trying to solve all tag quality problems at once:
+
+- `tag_redundancy`: high-confidence possible duplicate or subsumed tag pairs.
+- `empty_tag`: zero-atom, childless tags that are safe to review as cleanup opportunities.
+- Later: `scattered_tag`, `tag_mismatch`, and richer semantic-cohesion providers once the cohesion metric is better defined.
+
+`tag_redundancy` should use stable pair keys:
+
+```text
+tag_redundancy:pair:{canonical_sorted_tag_ids_hash}
+```
+
+The signal target can be the primary tag while the evidence carries both tags. This avoids inventing a new public target type before the UI needs one.
+
+Typed evidence should include:
+
+- both tag IDs, names, parent IDs, paths, and atom counts
+- shared atom count
+- Jaccard overlap
+- containment overlap
+- centroid similarity when both tags have embeddings
+- semantic edge overlap when cheap to compute
+- name similarity
+- hierarchy relationship: sibling, parent-child, ancestor-descendant, unrelated, or cross-category
+- whether either tag is an auto-tag target or structural category
+- merge-impact counts for the review UI, including child tags and whether the removed tag has a wiki
+- recommended review posture: possible duplicate, possible subsumption, or review overlap
+
+Default thresholds should be intentionally conservative:
+
+- Ignore pairs where both tags have fewer than 5 atoms unless overlap is exact and names are highly similar.
+- Prefer duplicate signals when Jaccard is very high and centroid/name/hierarchy evidence agrees.
+- Prefer subsumption signals when containment is high but Jaccard is much lower.
+- Suppress or strongly down-rank expected parent-child overlap.
+- Suppress cross-category pairs unless the evidence is overwhelming.
+- Keep empty-tag signals dashboard-only by default.
+
 ### 4. Concepts To Strengthen
 
 Find areas that look important but underdeveloped.
@@ -543,22 +590,6 @@ CREATE TABLE knowledge_signal_action_log (
     undone_at TEXT
 );
 
-CREATE TABLE briefing_signals (
-    id TEXT PRIMARY KEY,
-    briefing_id TEXT NOT NULL,
-    signal_key TEXT NOT NULL,
-    provider_id TEXT NOT NULL,
-    rank INTEGER NOT NULL,
-    score REAL NOT NULL,
-    confidence REAL NOT NULL,
-    target_json TEXT NOT NULL,
-    title TEXT NOT NULL,
-    summary TEXT NOT NULL,
-    reasons_json TEXT NOT NULL,
-    evidence_json TEXT NOT NULL,
-    suggested_actions_json TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
 ```
 
 The cache can be skipped initially if on-demand computation is fast enough, but feedback state should exist from the beginning. Dismiss/snooze is part of making the modular system tolerable.
@@ -594,12 +625,12 @@ Start with manual/on-demand evaluation:
 2. Server evaluates enabled providers for the active database.
 3. Results are normalized, filtered by feedback state, ranked, and returned to dashboard widgets.
 
-Briefing integration should use the same signal infrastructure:
+The dashboard's briefing surface should use the same signal infrastructure, but not the retired briefing storage path:
 
-1. Daily briefing generation determines its normal content window.
-2. Atomic evaluates briefing-eligible providers using that window where relevant.
-3. The top few signals are attached to the briefing response as structured suggestions.
-4. The UI renders those suggestions beside or below the generated briefing content.
+1. The featured-report widget fetches its latest report finding normally.
+2. The widget also requests briefing-eligible signals from the deterministic provider layer.
+3. The UI renders the top few signals beside or below the generated report finding content.
+4. Dismissal still writes to `knowledge_signal_feedback`, so refreshes and navigation do not resurrect dismissed suggestions.
 
 Do not make the LLM responsible for deciding which knowledge-quality suggestions to show. It can summarize recent atoms; deterministic providers should pick the actions.
 
@@ -611,15 +642,14 @@ Add caching once evaluation becomes expensive. A simple cache invalidation model
 - wiki generated/updated
 - semantic edges rebuilt
 
-For v1, it is acceptable to recompute all enabled deterministic dashboard providers for the active database when the dashboard opens, then cache for a short period. Briefing-attached signals should be stored with the briefing or reproducible from the same evaluation window so historical briefings do not drift.
+For v1, it is acceptable to recompute all enabled deterministic dashboard providers for the active database when the dashboard opens, then cache for a short period. Historical report findings do not snapshot these suggestions in the first implementation; signals are current maintenance prompts, not part of generated report content.
 
 ## API Surface
 
 Core:
 
 - `AtomicCore::list_knowledge_signals(filter)`
-- `AtomicCore::get_knowledge_signal(signal_key)`
-- `AtomicCore::list_briefing_knowledge_signals(window, limit)`
+- `AtomicCore::list_briefing_knowledge_signals(window, limit)` for the dashboard's briefing surface
 - `AtomicCore::set_knowledge_signal_provider_config(provider_id, config)`
 - `AtomicCore::dismiss_knowledge_signal(signal_key)`
 - `AtomicCore::snooze_knowledge_signal(signal_key, until)`
@@ -631,8 +661,7 @@ Core:
 Server:
 
 - `GET /api/knowledge-signals`
-- `GET /api/knowledge-signals/:signal_key`
-- `GET /api/knowledge-signals/briefing-candidates`
+- `GET /api/knowledge-signals?surface=briefing`
 - `PATCH /api/knowledge-signals/providers/:provider_id`
 - `POST /api/knowledge-signals/:signal_key/dismiss`
 - `POST /api/knowledge-signals/:signal_key/snooze`
@@ -643,9 +672,9 @@ Server:
 
 Frontend transport should expose these as normal commands. The React page should stay transport-agnostic.
 
-Briefing read shapes include attached signal suggestions by extending `BriefingWithCitations` with a `signals` field. Suggestions are persisted with each briefing so historical briefings do not drift as the knowledge base changes.
-
 ## Milestones
+
+Milestones 1-3 now establish the baseline pattern: typed deterministic providers, per-database preferences and feedback, SQLite/Postgres support, dashboard widgets, and live briefing-surface suggestions. Future milestones should preserve that pattern: each phase should be independently shippable, with conservative defaults and durable dismissals.
 
 ### Milestone 1 - Signal Foundation
 
@@ -660,15 +689,14 @@ Briefing read shapes include attached signal suggestions by extending `BriefingW
 
 Exit criteria: the existing dashboard can show deterministic signals from at least one provider, explain them, and remember when the user dismisses or snoozes them on either storage backend. There is no new dashboard route.
 
-### Milestone 2 - Briefing Suggestions
+### Milestone 2 - Briefing Surface Suggestions
 
 - Add `include_in_briefing` provider config.
-- Evaluate briefing-eligible signals during briefing generation or briefing fetch.
-- Attach the top signals to the briefing as structured suggestions.
-- Render a "Worth your attention" section in `BriefingWidget` / `BriefingContent`.
+- Evaluate briefing-eligible signals on demand for the reports-backed `BriefingWidget`.
+- Render a "Worth your attention" section below the latest featured report finding.
 - Keep deterministic suggestions separate from the LLM-generated briefing prose.
 
-Exit criteria: a generated briefing can include 3-5 actionable knowledge-quality suggestions, each with deterministic reasons and direct actions. Historical briefings show the same attached suggestions when revisited.
+Exit criteria: the dashboard briefing surface can include 3-5 actionable knowledge-quality suggestions, each with deterministic reasons and direct actions. Dismissed suggestions stay dismissed across refresh/navigation via signal feedback.
 
 ### Milestone 3 - Better Wiki Opportunities
 
@@ -681,12 +709,144 @@ Exit criteria: wiki suggestions are no longer ranked only by literal atom count,
 
 ### Milestone 4 - Organization Signals
 
-- Add conservative tag-redundancy detection using atom overlap, semantic overlap, hierarchy context, and name similarity.
-- Add empty-tag and low-value tag cleanup signals.
-- Add initial scattered-tag detection based on semantic cohesion.
-- Add UI actions for opening the tag, reviewing atoms, and starting merge/cleanup flows where those flows exist.
+- Add conservative tag-redundancy detection using atom overlap, hierarchy context, centroid similarity where available, and name similarity.
+- Add empty-tag cleanup signals for zero-atom, childless tags.
+- Add a compact dashboard widget for tag cleanup opportunities.
+- Make only the highest-confidence redundancy signals briefing-eligible.
+- Defer scattered-tag and tag-mismatch signals until semantic cohesion is defined beyond centroid similarity.
+- Add UI actions for opening tags and reviewing overlapping atoms. Merge, reparent, rename, and prune actions can appear as suggested actions only when the corresponding flow exists.
 
 Exit criteria: users can identify and dismiss high-confidence tag redundancy and cleanup opportunities without the system making subjective cleanup decisions automatically.
+
+#### Milestone 4A - Tag Redundancy Provider
+
+Implement `TagRedundancyProvider` as the first organization provider.
+
+Provider behavior:
+
+- Generate candidate tag pairs from shared atom membership rather than all-pairs tag comparison.
+- Compute Jaccard and containment for each pair.
+- Add hierarchy context: sibling, parent-child, ancestor-descendant, unrelated, or cross-category.
+- Add centroid similarity when both tags have centroids. If centroid data is unavailable, fall back to atom-overlap and hierarchy evidence rather than blocking the signal.
+- Add name similarity as supporting evidence, not as the main signal.
+- Return stable signal keys using canonical sorted tag IDs.
+- Emit typed evidence with both tag records, overlap statistics, semantic statistics, hierarchy relationship, and merge-impact fields.
+
+Initial conservative thresholds:
+
+- Candidate generation requires at least 3 shared atoms.
+- Duplicate-style signal requires Jaccard `>= 0.80`, or Jaccard `>= 0.65` plus strong name similarity and sibling/unrelated hierarchy.
+- Subsumption-style signal requires containment `>= 0.85`, the smaller tag has at least 5 atoms, and the relationship is not an obvious intentional parent-child scope.
+- Cross-category pairs require stricter thresholds and should usually be excluded from briefing.
+- Pairs involving structural category roots should be suppressed.
+
+Suggested reasons:
+
+- `36 shared atoms`
+- `90% overlap`
+- `similar tag scopes`
+- `sibling tags`
+- `one tag mostly contained in the other`
+
+Suggested actions:
+
+- `review_overlap`: open a review modal showing overlap metrics and atom counts unique to each tag.
+- `keep_separate`: durably ignore this pair unless the overlap evidence materially changes.
+- `open_primary_tag`
+- `open_secondary_tag`
+- `merge_tags`: merge one selected source tag into one selected target tag after preview and confirmation.
+
+#### Milestone 4B - Empty Tag Provider
+
+Implement `EmptyTagProvider` as a small dashboard-first cleanup provider.
+
+Provider behavior:
+
+- Identify tags with zero atoms and zero children.
+- Suppress structural category roots and provider/system categories.
+- Use stable keys: `empty_tag:tag:{tag_id}`.
+- Keep `include_in_briefing` disabled by default.
+
+Suggested reasons:
+
+- `0 atoms`
+- `no child tags`
+
+Suggested actions:
+
+- `open_tag`
+- `delete_empty_tag`, with confirmation. Empty childless tags have no atom assignments or descendants, so this can be the first direct cleanup action.
+
+The empty-tag row should show the destructive action plainly. It should not require the user to open the tag and find a separate delete button.
+
+#### Milestone 4C - Dashboard And Review UI
+
+Add a `Tag Cleanup` dashboard widget backed by organization signals.
+
+Initial widget behavior:
+
+- Show the top 5 tag cleanup signals.
+- Group or label rows by signal type: possible duplicate, possible subsumption, empty tag.
+- Render the strongest 1-2 reasons inline.
+- Support durable dismiss using existing knowledge-signal feedback.
+- Clicking a redundancy row should open a modal with:
+  - both tag names and hierarchy paths
+  - shared atom count and overlap metrics
+  - atom counts unique to each tag
+  - merge-impact counts, including atom assignments added, child tags moved, and whether a wiki would be deleted
+  - persistent action buttons in a bottom modal action bar
+  - suggested next action language that avoids implying automatic merge
+
+The review modal is part of the milestone, not a polish follow-up. Without it, redundancy signals are not actionable enough.
+
+Review view outcomes:
+
+- **Keep Separate:** records durable feedback for this pair and removes the signal.
+- **Merge:** requires choosing the tag to keep, then shows a confirmation before applying. The preview must show how many atom assignments will be added, child tags that will move, whether the removed tag has a wiki article, and the target tag that remains.
+- **Rename:** later, if a name cleanup action proves common enough to need an inline flow.
+- **Move:** later, if containment suggests hierarchy cleanup often enough to need a parent selector.
+- **Open Tags:** opens either tag in the normal tag-filtered view for manual inspection.
+
+Empty-tag outcomes:
+
+- **Delete:** confirms and applies through `delete_tag` with `recursive=false`.
+- **Keep:** dismisses or ignores the signal.
+
+#### Milestone 4D - Briefing Eligibility
+
+Only high-confidence redundancy signals should appear in briefings by default.
+
+Briefing inclusion rules:
+
+- Include duplicate-style tag redundancy when confidence is high and the pair is not cross-category.
+- Exclude empty tags.
+- Exclude low-confidence subsumption unless the score is very high and the hierarchy context is clear.
+- Cap organization signals so they do not crowd out wiki suggestions.
+
+#### Milestone 4E - Tests And Storage Parity
+
+The milestone is not shippable until both storage backends and feedback paths are covered.
+
+Core tests:
+
+- duplicate-like sibling tags produce a `tag_redundancy` signal with typed evidence
+- high containment produces a subsumption-style signal, not a duplicate-style title
+- parent-child overlap is down-ranked or suppressed
+- structural category roots are suppressed
+- dismissed redundancy signals are hidden unless dismissed signals are requested
+- provider dashboard/briefing preferences are honored
+
+Storage checks:
+
+- SQLite provider evaluation works against normal tag/atom fixtures.
+- Postgres provider evaluation uses the same evidence shape and purge behavior.
+- No new per-database state routes through registry settings.
+
+Frontend checks:
+
+- `Tag Cleanup` widget renders redundancy and empty-tag rows.
+- dismiss removes a row and persists through reload.
+- empty-state copy does not frame cleanup as required maintenance.
 
 ### Milestone 5 - Connection And Strength Signals
 
@@ -696,6 +856,36 @@ Exit criteria: users can identify and dismiss high-confidence tag redundancy and
 - Consider optional use of search/chat history if local metadata exists and the user has enabled the module.
 
 Exit criteria: Atomic can surface underconnected or underdeveloped knowledge areas without confusing them with processing failures.
+
+#### Milestone 5A - Missing Tag Overlap
+
+Implement `MissingTagOverlapProvider` as the first connection provider.
+
+Provider behavior:
+
+- Use existing semantic edges rather than a new clustering job.
+- For each atom, inspect nearby atoms above a conservative similarity threshold.
+- Count tags that repeatedly appear on nearby atoms but are missing from the target atom.
+- Suppress suggestions where the atom already has the tag or a direct ancestor/descendant tag.
+- Suppress structural category roots and tiny candidate tags unless similarity is very high.
+- Keep this dashboard-first by default; briefing eligibility can come later for very high-confidence cases.
+
+Typed evidence should include:
+
+- atom ID and title
+- current tag count
+- suggested tag record, including path, atom count, child count, and wiki presence
+- nearby tagged atom count
+- strongest similarity
+- average similarity
+
+Suggested actions:
+
+- `add_tag_to_atom`: apply the existing tag to the atom without rerunning the embedding/tagging pipeline.
+- `open_atom`
+- `dismiss`
+
+This action is low risk enough to ship before undo infrastructure because it only adds a normal manual tag assignment. Durable dismiss still applies so accepted or rejected suggestions do not immediately reappear.
 
 ### Milestone 6 - Link And Source Quality
 
@@ -745,9 +935,15 @@ Exit criteria: users can encode local knowledge-quality expectations without wri
 2. Should provider preferences be per-database only, or should users be able to set global defaults for new databases?
 3. Should profiles appear during onboarding, in settings, or as dashboard customization?
 4. How much local activity history should Atomic track for ranking, if any?
-5. Should wiki opportunity scoring use semantic edges only, raw embedding comparisons, or both?
+5. Should future wiki opportunity scoring use semantic edges only, raw embedding comparisons, or both?
 6. Should dismissed signals be hidden forever, or reappear when their reason components materially change?
-7. Should briefing-attached suggestions be persisted with each briefing, or recomputed from the briefing window when the briefing is viewed?
-8. Which mutating actions are safe enough for direct execution with undo, and which should always be proposals?
-9. Which custom rule templates should ship first?
-10. Should custom rules be allowed in briefing suggestions by default, or dashboard-only until the user opts in?
+7. Which mutating actions are safe enough for direct execution with undo, and which should always be proposals?
+8. Which custom rule templates should ship first?
+9. Should custom rules be allowed in briefing-surface suggestions by default, or dashboard-only until the user opts in?
+
+## Resolved Decisions
+
+- Briefing-surface suggestions are live dashboard prompts backed by signal feedback, not persisted report-finding content.
+- The existing dashboard is the surface for these signals; do not add a second health or quality dashboard.
+- Wiki update suggestions should come from `wiki_update` signals, not from local dashboard atom-count deltas.
+- Custom rules are valuable but should come after built-in providers, feedback state, drilldowns, and action audit are stable.
