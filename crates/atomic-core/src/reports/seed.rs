@@ -145,15 +145,28 @@ pub async fn seed_default_briefing_report(core: &AtomicCore) -> Result<(), Atomi
 
     let report = core.create_report(req).await?;
 
-    // Critique #1: carry the briefing's last-run timestamp onto the seeded
-    // report so the first scheduled run after collapse picks up only the
-    // atoms the briefing hadn't already covered. Without this, a busy DB
-    // would re-brief weeks of already-briefed content.
-    if let Some(last_run) = scheduler::state::get_last_run(core, "daily_briefing").await? {
-        storage
-            .update_report_cache_sync(&report.id, Some(&last_run.to_rfc3339()), None, None)
-            .await?;
-    }
+    // Carry the briefing's last-run timestamp onto the seeded report so
+    // the first scheduled run after collapse picks up only the atoms the
+    // briefing hadn't already covered. Without this, a busy DB would
+    // re-brief weeks of already-briefed content.
+    //
+    // When no legacy last-run exists (older briefing impls that didn't
+    // populate that settings key, or a DB whose briefing never fired),
+    // stamp `now()` rather than leaving the field None. The
+    // `SinceLastRun` scope resolver treats a missing `last_run_at` as
+    // "first-ever run, scope = everything since epoch"
+    // (scope.rs::resolve_source_window) — fine semantics for a freshly
+    // *created* report, dangerous for a freshly *seeded-from-history*
+    // one. Stamping `now()` says "the migration is the de-facto first
+    // run; next scheduled fire should only pick up captures from here
+    // on."
+    let last_run = scheduler::state::get_last_run(core, "daily_briefing")
+        .await?
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+    storage
+        .update_report_cache_sync(&report.id, Some(&last_run), None, None)
+        .await?;
 
     storage
         .set_setting_sync(FEATURED_REPORT_SETTING, &report.id)
@@ -218,6 +231,54 @@ pub async fn migrate_briefings_to_findings(core: &AtomicCore) -> Result<usize, A
     };
 
     let rows = storage.fetch_legacy_briefings_sync().await?;
+    if !rows.is_empty() {
+        // Surface the migration upfront so a multi-second startup hang
+        // doesn't look like a frozen launch when tail-following logs.
+        // (Doesn't reach the UI yet — the HTTP listener hasn't bound.
+        // A later change to background the migration post-bind would
+        // light up a real progress indicator.)
+        tracing::info!(
+            count = rows.len(),
+            "[reports/seed] migrating legacy briefings to findings; this may take a moment",
+        );
+    }
+
+    // Pre-flight: build the set of cited atoms that still exist. A
+    // single dangling citation (cited_atom_id pointing at an atom the
+    // user has since deleted) would otherwise trip the
+    // `report_finding_citations.cited_atom_id` foreign key inside
+    // `write_finding_transactionally_sync`, aborting that row's
+    // transaction and bubbling up — which kills the entire migration
+    // and parks the legacy tables forever (the per-DB flag never gets
+    // set, so every reboot re-attempts and re-fails on the same row).
+    //
+    // Cheaper to take the hit of N point-lookups against `atoms` once
+    // up front than to risk a permanent stuck-migration on any user
+    // who has ever deleted a cited atom. Dropped citations are logged;
+    // the briefing prose itself migrates intact, just with fewer
+    // resolvable [N] markers.
+    let mut unique_cited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for row in &rows {
+        for c in &row.citations {
+            unique_cited.insert(c.atom_id.clone());
+        }
+    }
+    let mut extant_cited: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(unique_cited.len());
+    for id in &unique_cited {
+        if storage.get_atom_impl(id).await?.is_some() {
+            extant_cited.insert(id.clone());
+        }
+    }
+    let dangling_count = unique_cited.len() - extant_cited.len();
+    if dangling_count > 0 {
+        tracing::warn!(
+            dangling = dangling_count,
+            total_unique = unique_cited.len(),
+            "[reports/seed] some briefing citations reference deleted atoms; dropping",
+        );
+    }
+
     let mut written = 0usize;
     let mut skipped = 0usize;
 
@@ -256,6 +317,7 @@ pub async fn migrate_briefings_to_findings(core: &AtomicCore) -> Result<usize, A
         let citations: Vec<ReportFindingCitation> = row
             .citations
             .iter()
+            .filter(|c| extant_cited.contains(&c.atom_id))
             .map(|c| ReportFindingCitation {
                 finding_atom_id: atom_id.clone(),
                 cited_atom_id: c.atom_id.clone(),
