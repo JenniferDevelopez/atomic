@@ -7653,9 +7653,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seed_creates_reports_briefings_tag_idempotently() {
-        // `get_all_tags()` returns a hierarchical tree; flatten so a child
-        // tag under a freshly-created top-level category is visible.
+    async fn seed_does_not_create_system_tags() {
+        // The Reports page is the canonical surface for findings; the
+        // `kind='report'` discriminator already does the segregation a
+        // system tag would. An earlier draft created `Reports` and
+        // `Reports/Briefings` system tags as the seeded report's default
+        // output tags — see git history — but they only duplicated the
+        // discriminator's work while introducing a name-collision footgun
+        // against user-owned tags. Lock in that no auto-tag pollution
+        // happens at seed time, and the seeded report's output tags stay
+        // empty (matching user-created reports' default).
         fn flatten(tree: &[TagWithCount]) -> Vec<&TagWithCount> {
             let mut out: Vec<&TagWithCount> = Vec::new();
             fn walk<'a>(node: &'a TagWithCount, out: &mut Vec<&'a TagWithCount>) {
@@ -7671,17 +7678,28 @@ mod tests {
         }
 
         let (db, _temp) = create_test_db().await;
+        let pre_tree = db.get_all_tags().await.unwrap();
+        let pre_count = flatten(&pre_tree).len();
         seed_default_briefing_report(&db).await.unwrap();
+        // Run twice — idempotency contract is preserved separately by
+        // the seed flag; we also want to confirm the no-tag promise
+        // holds across re-runs.
         seed_default_briefing_report(&db).await.unwrap();
-        let tree = db.get_all_tags().await.unwrap();
-        let flat = flatten(&tree);
-        let reports = flat
-            .iter()
-            .filter(|t| t.tag.name == "Reports" && t.tag.parent_id.is_none())
-            .count();
-        let briefings = flat.iter().filter(|t| t.tag.name == "Briefings").count();
-        assert_eq!(reports, 1, "exactly one Reports top-level tag");
-        assert_eq!(briefings, 1, "exactly one Briefings child tag");
+        let post_tree = db.get_all_tags().await.unwrap();
+        let post = flatten(&post_tree);
+        assert_eq!(
+            post.len(),
+            pre_count,
+            "seed must not create any tags (saw {:?})",
+            post.iter().map(|t| &t.tag.name).collect::<Vec<_>>()
+        );
+
+        let reports = db.list_reports().await.unwrap();
+        assert_eq!(reports.len(), 1);
+        assert!(
+            reports[0].output_atom_tags.is_empty(),
+            "seeded report's output tags must be empty"
+        );
     }
 
     #[tokio::test]

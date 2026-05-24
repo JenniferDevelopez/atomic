@@ -33,9 +33,6 @@ const DEFAULT_REPORT_DESCRIPTION: &str =
 /// supplies its own agent-loop scaffold.
 const DEFAULT_RESEARCH_PROMPT: &str = "Synthesize the source atoms — notes the user has captured since the last briefing — into a 2-3 paragraph briefing that highlights what's noteworthy, what themes emerge, and where these new notes connect to existing knowledge. Use [N] inline citation markers to point at specific source atoms. Skip atoms that aren't noteworthy. Write in the user's voice: concise, direct, mildly analytical, no filler.";
 
-const REPORTS_PARENT_TAG: &str = "Reports";
-const BRIEFINGS_TAG: &str = "Briefings";
-
 use crate::FEATURED_REPORT_SETTING;
 
 const MIGRATION_FLAG_SETTING: &str = "briefings.migrated_to_findings";
@@ -75,9 +72,11 @@ pub struct LegacyBriefingCitation {
 }
 
 /// Idempotent default-report seed. Pulls the legacy briefing schedule and
-/// prompt from the per-DB settings table, builds the equivalent reports row,
-/// stamps `Reports/Briefings`, points the dashboard at it, and clears the
-/// legacy prompt key so the report row is the new source of truth.
+/// prompt from the per-DB settings table, builds the equivalent reports
+/// row with empty `output_atom_tags` (the Reports page is the canonical
+/// surface for findings; the `kind='report'` discriminator already
+/// segregates them), points the dashboard at it, and clears the legacy
+/// prompt key so the report row is the new source of truth.
 ///
 /// Idempotency: anchored on the `reports.default_briefing_seeded` flag. The
 /// flag is set after the first successful seed; subsequent boots see it set
@@ -120,8 +119,6 @@ pub async fn seed_default_briefing_report(core: &AtomicCore) -> Result<(), Atomi
 
     let (schedule, schedule_tz, enabled) = legacy_schedule_to_cron(&settings);
 
-    let tag_id = ensure_reports_briefings_tag(core).await?;
-
     let req = CreateReportRequest {
         name: DEFAULT_REPORT_NAME.to_string(),
         description: Some(DEFAULT_REPORT_DESCRIPTION.to_string()),
@@ -140,7 +137,16 @@ pub async fn seed_default_briefing_report(core: &AtomicCore) -> Result<(), Atomi
         schedule,
         schedule_tz: Some(schedule_tz),
         enabled,
-        output_atom_tags: vec![tag_id],
+        // No system-owned tag for findings: the Reports page is the
+        // canonical surface for them, and the `kind='report'` atom
+        // discriminator already segregates them from captured atoms in
+        // every consumer (atoms grid, AtomCreated subscriptions, etc.).
+        // A `Reports/Briefings` system tag was tried earlier — see git
+        // history — but it duplicated the discriminator's work while
+        // adding a name-collision footgun against user-owned tags.
+        // User-created reports already default to empty output tags;
+        // the seeded one now matches.
+        output_atom_tags: Vec::new(),
     };
 
     let report = core.create_report(req).await?;
@@ -428,30 +434,6 @@ fn legacy_schedule_to_cron(
         .unwrap_or_else(|| iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".to_string()));
 
     (cron, tz, enabled)
-}
-
-/// Idempotently ensure `Reports` (top-level) and `Reports/Briefings` (child)
-/// exist, and return the child tag's id. Uses `create_tag` so the system
-/// can authorize a new top-level category — `get_or_create_tag` refuses to
-/// (that path is LLM-guard rail for the auto-tagger and must keep saying no
-/// to new categories invented from agent prose).
-async fn ensure_reports_briefings_tag(core: &AtomicCore) -> Result<String, AtomicCoreError> {
-    let all_tags = core.get_all_tags().await?;
-    let parent_id = match all_tags
-        .iter()
-        .find(|t| t.tag.parent_id.is_none() && t.tag.name == REPORTS_PARENT_TAG)
-    {
-        Some(t) => t.tag.id.clone(),
-        None => core.create_tag(REPORTS_PARENT_TAG, None).await?.id,
-    };
-    if let Some(existing) = all_tags
-        .iter()
-        .find(|t| t.tag.parent_id.as_deref() == Some(&parent_id) && t.tag.name == BRIEFINGS_TAG)
-    {
-        return Ok(existing.tag.id.clone());
-    }
-    let child = core.create_tag(BRIEFINGS_TAG, Some(&parent_id)).await?;
-    Ok(child.id)
 }
 
 fn parse_hh_mm(raw: &str) -> Option<(u32, u32)> {
