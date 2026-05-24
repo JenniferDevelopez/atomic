@@ -31,7 +31,7 @@ const DEFAULT_REPORT_DESCRIPTION: &str =
 /// the same intent as the legacy `briefing::SYSTEM_PROMPT` but phrased as
 /// a research prompt (the "what to investigate"), since the reports runner
 /// supplies its own agent-loop scaffold.
-const DEFAULT_RESEARCH_PROMPT: &str = "Synthesize the source atoms — notes the user has captured since the last briefing — into a 2-3 paragraph briefing that highlights what's noteworthy, what themes emerge, and where these new notes connect to existing knowledge. Use [N] inline citation markers to point at specific source atoms. Skip atoms that aren't noteworthy. Write in the user's voice: concise, direct, mildly analytical, no filler.";
+const DEFAULT_RESEARCH_PROMPT: &str = "Synthesize the source atoms — notes the user has captured since the last briefing — into a 2-3 paragraph briefing that highlights what's noteworthy, what themes emerge, and where these new notes connect to existing knowledge. Skip atoms that aren't noteworthy. Write in the user's voice: concise, direct, mildly analytical, no filler.";
 
 use crate::FEATURED_REPORT_SETTING;
 

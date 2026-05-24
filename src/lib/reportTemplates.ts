@@ -37,7 +37,7 @@ export const REPORT_TEMPLATES: ReportTemplate[] = [
       name: 'Daily Briefing',
       description: 'Daily recap of new atoms within a chosen topic.',
       research_prompt:
-        "Synthesize today's new source atoms into a 2-3 paragraph briefing that highlights what's noteworthy, what themes emerge, and where these new notes connect to existing knowledge. Use [N] inline citations to point at specific source atoms. Skip atoms that aren't noteworthy. Write in the user's voice: concise, direct, mildly analytical, no filler.",
+        "Synthesize today's new source atoms into a 2-3 paragraph briefing that highlights what's noteworthy, what themes emerge, and where these new notes connect to existing knowledge. Skip atoms that aren't noteworthy. Write in the user's voice: concise, direct, mildly analytical, no filler.",
       schedule: '0 0 9 * * *',
       schedule_tz: null,
       enabled: true,

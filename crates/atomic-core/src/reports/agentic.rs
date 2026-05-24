@@ -217,6 +217,15 @@ fn build_user_prompt(report: &Report, source: &[AtomWithTags], total_in_scope: i
     out.push_str(&report.research_prompt);
     out.push_str("\n\n");
 
+    // Universal citation directive. The system scaffold also covers
+    // citations, but restating it in the user message — right next to
+    // the research prompt and the source list — both raises the
+    // model's attention to it and frees individual prompts (templates,
+    // user-authored) from having to re-state it. The system scaffold
+    // carries the longer-form rules (no-invented-numbers,
+    // source_and_context semantics); this is the inline reminder.
+    out.push_str("Cite source atoms with [N] inline markers using the bracketed numbers from the source list below.\n\n");
+
     if source.is_empty() {
         out.push_str("(no source atoms — this should be unreachable; the runner short-circuits empty scopes)\n");
         return out;
