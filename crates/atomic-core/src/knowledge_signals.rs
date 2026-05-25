@@ -327,7 +327,7 @@ pub async fn list_knowledge_signals(
         }
 
         let config = get_provider_config(core, provider.id()).await?;
-        if !config.enabled || !config.show_on_dashboard {
+        if !config.enabled {
             continue;
         }
 
@@ -6109,7 +6109,7 @@ mod tests {
         .await
         .unwrap();
 
-        let hidden = list_knowledge_signals(
+        let generic_signals = list_knowledge_signals(
             &core,
             KnowledgeSignalFilter {
                 provider_id: Some(WIKI_CANDIDATE_PROVIDER_ID.to_string()),
@@ -6118,7 +6118,16 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(hidden.is_empty());
+        assert!(generic_signals
+            .iter()
+            .any(|signal| signal.target.id == tag.id));
+
+        let dashboard = list_dashboard_knowledge_signals(&core, 20).await.unwrap();
+        assert!(!dashboard
+            .groups
+            .iter()
+            .flat_map(|group| group.signals.iter())
+            .any(|signal| signal.target.id == tag.id));
     }
 
     #[tokio::test]
@@ -6251,18 +6260,63 @@ mod tests {
             .await
             .unwrap();
 
+        let mut atom_ids = Vec::new();
         for i in 0..6 {
-            core.create_atom(
-                CreateAtomRequest {
-                    content: long_note(&format!("Agent systems {i}")),
-                    source_url: Some(format!("https://example.com/agents/{i}")),
-                    tag_ids: vec![tag_a.id.clone(), tag_b.id.clone()],
-                    ..Default::default()
-                },
-                |_| {},
+            let atom = core
+                .create_atom(
+                    CreateAtomRequest {
+                        content: long_note(&format!("Agent systems {i}")),
+                        source_url: Some(format!("https://example.com/agents/{i}")),
+                        tag_ids: vec![tag_a.id.clone(), tag_b.id.clone()],
+                        ..Default::default()
+                    },
+                    |_| {},
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            atom_ids.push(atom.atom.id);
+        }
+
+        {
+            let db = core.database().unwrap();
+            let conn = db.conn.lock().unwrap();
+            let now = Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT INTO wiki_articles (id, tag_id, content, created_at, updated_at, atom_count)
+                 VALUES (?1, ?2, 'source article', ?3, ?3, 1)",
+                params!["source-wiki", &tag_b.id, &now],
             )
-            .await
-            .unwrap()
+            .unwrap();
+            conn.execute(
+                "INSERT INTO wiki_articles_fts (id, tag_id, tag_name, content)
+                 VALUES (?1, ?2, ?3, 'source article')",
+                params!["source-wiki", &tag_b.id, &tag_b.name],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO wiki_citations (id, wiki_article_id, citation_index, atom_id, chunk_index, excerpt)
+                 VALUES (?1, 'source-wiki', 1, ?2, NULL, 'excerpt')",
+                params!["source-citation", &atom_ids[0]],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO wiki_article_versions (id, tag_id, content, citations_json, atom_count, version_number, created_at)
+                 VALUES (?1, ?2, 'old source article', '[]', 1, 1, ?3)",
+                params!["source-version", &tag_b.id, &now],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO wiki_proposals (id, tag_id, base_article_id, base_updated_at, content, citations_json, ops_json, new_atom_count, created_at)
+                 VALUES (?1, ?2, 'source-wiki', ?3, 'proposal', '[]', '[]', 1, ?3)",
+                params!["source-proposal", &tag_b.id, &now],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO wiki_links (id, source_article_id, target_tag_name, target_tag_id, created_at)
+                 VALUES (?1, 'source-wiki', ?2, ?3, ?4)",
+                params!["source-link", &tag_a.name, &tag_a.id, &now],
+            )
             .unwrap();
         }
 
@@ -6299,11 +6353,47 @@ mod tests {
         let result = core.merge_tags(&tag_b.id, &tag_a.id).await.unwrap();
         assert_eq!(result.atoms_retagged, 0);
         assert_eq!(result.children_reparented, 0);
+        assert!(result.source_wiki_deleted);
 
         let remaining = core.get_all_tags().await.unwrap();
         let flat = flatten_test_tags(&remaining);
         assert!(flat.iter().any(|tag| tag.id == tag_a.id));
         assert!(!flat.iter().any(|tag| tag.id == tag_b.id));
+
+        let db = core.database().unwrap();
+        let conn = db.conn.lock().unwrap();
+        for (table, column) in [
+            ("atom_tags", "tag_id"),
+            ("wiki_articles", "tag_id"),
+            ("wiki_articles_fts", "tag_id"),
+            ("wiki_article_versions", "tag_id"),
+            ("wiki_proposals", "tag_id"),
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?1"),
+                    [&tag_b.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "{table} retained source tag rows");
+        }
+        let citation_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM wiki_citations WHERE wiki_article_id = 'source-wiki'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(citation_count, 0);
+        let link_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM wiki_links WHERE source_article_id = 'source-wiki'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(link_count, 0);
     }
 
     #[tokio::test]

@@ -1488,6 +1488,35 @@ impl AtomicCore {
                         "UPDATE tags SET parent_id = ?1 WHERE parent_id = ?2",
                         rusqlite::params![&target, &source],
                     )? as i32;
+                    tx.execute(
+                        "UPDATE wiki_links SET target_tag_id = ?1 WHERE target_tag_id = ?2",
+                        rusqlite::params![&target, &source],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM wiki_citations
+                         WHERE wiki_article_id IN (
+                            SELECT id FROM wiki_articles WHERE tag_id = ?1
+                         )",
+                        [&source],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM wiki_links
+                         WHERE source_article_id IN (
+                            SELECT id FROM wiki_articles WHERE tag_id = ?1
+                         )",
+                        [&source],
+                    )?;
+                    tx.execute("DELETE FROM wiki_articles_fts WHERE tag_id = ?1", [&source])?;
+                    tx.execute(
+                        "DELETE FROM wiki_article_versions WHERE tag_id = ?1",
+                        [&source],
+                    )?;
+                    tx.execute("DELETE FROM wiki_proposals WHERE tag_id = ?1", [&source])?;
+                    tx.execute("DELETE FROM wiki_articles WHERE tag_id = ?1", [&source])?;
+                    tx.execute("DELETE FROM atom_tags WHERE tag_id = ?1", [&source])?;
+                    tx.execute("DELETE FROM tag_embeddings WHERE tag_id = ?1", [&source])?;
+                    tx.execute("DELETE FROM conversation_tags WHERE tag_id = ?1", [&source])?;
+                    tx.execute("DELETE FROM tags WHERE id = ?1", [&source])?;
                     tx.commit()?;
 
                     Ok(MergeTagsResult {
@@ -1627,9 +1656,6 @@ impl AtomicCore {
             }
         };
 
-        if matches!(&self.storage, storage::StorageBackend::Sqlite(_)) {
-            self.storage.delete_tag_impl(source_tag_id, false).await?;
-        }
         self.canvas_cache.invalidate();
         self.dashboard_signal_cache.invalidate();
         Ok(result)
