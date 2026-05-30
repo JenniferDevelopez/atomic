@@ -410,11 +410,13 @@ async fn run_server(
         }
     }
 
-    // Canvas cache warmup: compute the global canvas payload for every
+    // Canvas cache warmup: compute the global canvas payload for the default
     // database in the background so the first request after startup hits a
-    // warm cache. Sequenced across databases (not parallel) to avoid an
-    // N-way PCA spike on startup, and off-loaded to the blocking pool so it
-    // never ties up an async worker.
+    // warm cache. Only the default DB is warmed — other databases rebuild
+    // their canvas lazily on first view, so we neither pay PCA nor retain a
+    // full canvas payload (atoms + positions + edges) for databases nobody is
+    // looking at. Off-loaded to the blocking pool so it never ties up an async
+    // worker.
     {
         let warm_manager = Arc::clone(&manager);
         tokio::spawn(async move {
@@ -425,26 +427,31 @@ async fn run_server(
                     return;
                 }
             };
-            for db_info in &databases {
-                let db_core = match warm_manager.get_core(&db_info.id).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!(db = %db_info.name, error = %e, "canvas warmup: failed to load database");
-                        continue;
-                    }
-                };
-                let db_name = db_info.name.clone();
-                let started = std::time::Instant::now();
-                match db_core.compute_and_get_canvas_data().await {
-                    Ok(data) => tracing::info!(
-                        db = %db_name,
-                        atoms = data.atoms.len(),
-                        elapsed_ms = started.elapsed().as_millis() as u64,
-                        "canvas cache warmed"
-                    ),
-                    Err(e) => {
-                        tracing::warn!(db = %db_name, error = %e, "canvas cache warmup failed")
-                    }
+            let Some(db_info) = databases
+                .iter()
+                .find(|d| d.is_default)
+                .or_else(|| databases.first())
+            else {
+                return;
+            };
+            let db_core = match warm_manager.get_core(&db_info.id).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(db = %db_info.name, error = %e, "canvas warmup: failed to load database");
+                    return;
+                }
+            };
+            let db_name = db_info.name.clone();
+            let started = std::time::Instant::now();
+            match db_core.compute_and_get_canvas_data().await {
+                Ok(data) => tracing::info!(
+                    db = %db_name,
+                    atoms = data.atoms.len(),
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "canvas cache warmed"
+                ),
+                Err(e) => {
+                    tracing::warn!(db = %db_name, error = %e, "canvas cache warmup failed")
                 }
             }
         });

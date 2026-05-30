@@ -4,6 +4,15 @@ services:
     environment:
       - PUBLIC_URL=${PUBLIC_URL:-}
       - ATOMIC_SETUP_TOKEN=${ATOMIC_SETUP_TOKEN:-}
+      # SQLite memory tuning. Each database opens one writer + N read
+      # connections, and every connection carries its own page cache, so
+      # steady-state RAM scales as (1 + read_pool) × cache_kb × num_databases.
+      # On a memory-constrained host (e.g. 8 GB) running several databases,
+      # lower the read pool and read-cache budget. Defaults: pool=16,
+      # write=64000 KiB, read=8000 KiB.
+      - ATOMIC_SERVER_READ_POOL_SIZE=${ATOMIC_SERVER_READ_POOL_SIZE:-}
+      - ATOMIC_SQLITE_CACHE_KB=${ATOMIC_SQLITE_CACHE_KB:-}
+      - ATOMIC_SQLITE_READ_CACHE_KB=${ATOMIC_SQLITE_READ_CACHE_KB:-}
     volumes:
       - atomic-data:/data
     networks:

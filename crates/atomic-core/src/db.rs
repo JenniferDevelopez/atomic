@@ -5,23 +5,77 @@ use rusqlite::ffi::sqlite3_auto_extension;
 use rusqlite::Connection;
 use sqlite_vec::sqlite3_vec_init;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
+/// Read-pool size for standalone/desktop use (single client, low concurrency).
 const READ_POOL_SIZE: usize = 4;
-const SERVER_READ_POOL_SIZE: usize = 16;
+
+/// Default read-pool size for server use. Each pooled connection carries its
+/// own SQLite page cache, so this multiplies memory by `pool_size × cache_kb`
+/// per database. The pool is an optimization, not a correctness requirement —
+/// [`Database::read_conn`] falls back to a temporary connection when every slot
+/// is busy — so shrinking it on a memory-constrained host only trades a little
+/// pooling under burst for lower steady-state RAM. Override at runtime with
+/// `ATOMIC_SERVER_READ_POOL_SIZE`.
+const DEFAULT_SERVER_READ_POOL_SIZE: usize = 16;
+
+/// Default page-cache budget (in KiB) for writer connections. SQLite reads a
+/// negative `cache_size` as a KiB limit rather than a page count. Override with
+/// `ATOMIC_SQLITE_CACHE_KB`.
+const DEFAULT_WRITE_CACHE_KB: i64 = 64_000;
+
+/// Default page-cache budget (in KiB) for pooled read connections. With
+/// `mmap_size` mapping the database file, read queries are largely served from
+/// the shared memory map, so a large *private* page cache per read connection
+/// is mostly redundant — hence a much smaller default than the writer. This is
+/// the lever that previously made N read connections each hold ~64 MB. Override
+/// with `ATOMIC_SQLITE_READ_CACHE_KB`.
+const DEFAULT_READ_CACHE_KB: i64 = 8_000;
 
 /// Statement cache capacity per connection (default is 16, too small for our query variety)
 const STMT_CACHE_CAPACITY: usize = 64;
 
-/// Base PRAGMAs applied to every connection
-const BASE_PRAGMAS: &str = "\
-    PRAGMA journal_mode=WAL; \
-    PRAGMA synchronous=NORMAL; \
-    PRAGMA busy_timeout=5000; \
-    PRAGMA cache_size=-64000; \
-    PRAGMA mmap_size=2147483648; \
-    PRAGMA temp_store=MEMORY; \
-";
+/// Parse an environment variable into `T`, falling back to `default` when it is
+/// unset or fails to parse.
+fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+/// Read pool size for server connections (env-overridable, parsed once).
+fn server_read_pool_size() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| env_or("ATOMIC_SERVER_READ_POOL_SIZE", DEFAULT_SERVER_READ_POOL_SIZE))
+}
+
+/// Page-cache budget in KiB for writer connections (env-overridable, parsed once).
+fn write_cache_kb() -> i64 {
+    static V: OnceLock<i64> = OnceLock::new();
+    *V.get_or_init(|| env_or("ATOMIC_SQLITE_CACHE_KB", DEFAULT_WRITE_CACHE_KB))
+}
+
+/// Page-cache budget in KiB for read connections (env-overridable, parsed once).
+fn read_cache_kb() -> i64 {
+    static V: OnceLock<i64> = OnceLock::new();
+    *V.get_or_init(|| env_or("ATOMIC_SQLITE_READ_CACHE_KB", DEFAULT_READ_CACHE_KB))
+}
+
+/// Build the PRAGMA batch applied to a connection. `cache_kb` is the page-cache
+/// budget in KiB; it is emitted as a negative `cache_size` so SQLite treats it
+/// as a memory limit rather than a page count. Writer and reader connections
+/// pass different budgets via [`write_cache_kb`] / [`read_cache_kb`].
+fn connection_pragmas(cache_kb: i64) -> String {
+    format!(
+        "PRAGMA journal_mode=WAL; \
+         PRAGMA synchronous=NORMAL; \
+         PRAGMA busy_timeout=5000; \
+         PRAGMA cache_size=-{cache_kb}; \
+         PRAGMA mmap_size=2147483648; \
+         PRAGMA temp_store=MEMORY;"
+    )
+}
 
 /// A read-only connection handle — either borrowed from the pool or a temporary connection.
 pub enum ReadConn<'a> {
@@ -82,7 +136,10 @@ impl Database {
         // All pool slots busy — create a temporary connection
         let conn = Connection::open(&self.db_path)?;
         conn.set_prepared_statement_cache_capacity(STMT_CACHE_CAPACITY);
-        conn.execute_batch(&format!("{} PRAGMA query_only=ON;", BASE_PRAGMAS))?;
+        conn.execute_batch(&format!(
+            "{} PRAGMA query_only=ON;",
+            connection_pragmas(read_cache_kb())
+        ))?;
         Ok(ReadConn::Temp(conn))
     }
 
@@ -93,14 +150,14 @@ impl Database {
         // which applies to all connections opened after that call.
         let conn = Connection::open(&self.db_path)?;
         conn.set_prepared_statement_cache_capacity(STMT_CACHE_CAPACITY);
-        conn.execute_batch(BASE_PRAGMAS)?;
+        conn.execute_batch(&connection_pragmas(write_cache_kb()))?;
         Ok(conn)
     }
 
     /// Open with a larger read pool sized for server workloads.
     /// Creates the DB and parent directories if they don't exist.
     pub fn open_for_server(path: impl AsRef<Path>) -> Result<Self, AtomicCoreError> {
-        Self::open_with_pool_size(path.as_ref(), true, SERVER_READ_POOL_SIZE)
+        Self::open_with_pool_size(path.as_ref(), true, server_read_pool_size())
     }
 
     /// Open a registry-backed data database with a larger read pool.
@@ -112,7 +169,7 @@ impl Database {
         Self::open_with_pool_size_and_settings_cleanup(
             path.as_ref(),
             true,
-            SERVER_READ_POOL_SIZE,
+            server_read_pool_size(),
             true,
         )
     }
@@ -140,7 +197,7 @@ impl Database {
 
         conn.execute_batch(&format!(
             "{} PRAGMA journal_size_limit=67108864;",
-            BASE_PRAGMAS
+            connection_pragmas(write_cache_kb())
         ))?;
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
 
@@ -154,7 +211,10 @@ impl Database {
         for _ in 0..pool_size {
             let rc = Connection::open(&db_path)?;
             rc.set_prepared_statement_cache_capacity(STMT_CACHE_CAPACITY);
-            rc.execute_batch(&format!("{} PRAGMA query_only=ON;", BASE_PRAGMAS))?;
+            rc.execute_batch(&format!(
+                "{} PRAGMA query_only=ON;",
+                connection_pragmas(read_cache_kb())
+            ))?;
             read_pool.push(Mutex::new(rc));
         }
 
