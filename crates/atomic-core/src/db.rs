@@ -19,9 +19,9 @@ const READ_POOL_SIZE: usize = 4;
 /// `ATOMIC_SERVER_READ_POOL_SIZE`.
 const DEFAULT_SERVER_READ_POOL_SIZE: usize = 16;
 
-/// Default page-cache budget (in KiB) for writer connections. SQLite reads a
-/// negative `cache_size` as a KiB limit rather than a page count. Override with
-/// `ATOMIC_SQLITE_CACHE_KB`.
+/// Default page-cache budget (in KiB) for writer connections. Override with
+/// `ATOMIC_SQLITE_CACHE_KB` — the value is interpreted as KiB regardless of
+/// sign (see [`connection_pragmas`]), so `64000` and `-64000` are equivalent.
 const DEFAULT_WRITE_CACHE_KB: i64 = 64_000;
 
 /// Default page-cache budget (in KiB) for pooled read connections. With
@@ -63,15 +63,20 @@ fn read_cache_kb() -> i64 {
 }
 
 /// Build the PRAGMA batch applied to a connection. `cache_kb` is the page-cache
-/// budget in KiB; it is emitted as a negative `cache_size` so SQLite treats it
-/// as a memory limit rather than a page count. Writer and reader connections
-/// pass different budgets via [`write_cache_kb`] / [`read_cache_kb`].
+/// budget in KiB; its magnitude is emitted as a negative `cache_size` so SQLite
+/// treats it as a memory limit rather than a page count. The sign of the input
+/// is ignored — both `8000` and SQLite's own negative-for-KiB convention
+/// (`-8000`) mean "8000 KiB" — which avoids a `cache_size=--8000` syntax error
+/// (the `--` would start a SQL comment and truncate the statement) if an
+/// operator sets the env knob using that convention. Writer and reader
+/// connections pass different budgets via [`write_cache_kb`] / [`read_cache_kb`].
 fn connection_pragmas(cache_kb: i64) -> String {
+    let cache_kib = cache_kb.unsigned_abs();
     format!(
         "PRAGMA journal_mode=WAL; \
          PRAGMA synchronous=NORMAL; \
          PRAGMA busy_timeout=5000; \
-         PRAGMA cache_size=-{cache_kb}; \
+         PRAGMA cache_size=-{cache_kib}; \
          PRAGMA mmap_size=2147483648; \
          PRAGMA temp_store=MEMORY;"
     )
