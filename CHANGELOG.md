@@ -2,6 +2,12 @@
 
 All notable changes to Atomic are documented here.
 
+## v1.39.1 — 2026-05-30
+
+- Reduce memory usage for read connections by giving each a smaller default page cache (8 MB instead of 64 MB)
+- Add environment variables to tune SQLite memory and connection-pool settings (`ATOMIC_SERVER_READ_POOL_SIZE`, `ATOMIC_SQLITE_CACHE_KB`, `ATOMIC_SQLITE_READ_CACHE_KB`)
+- Improve server startup time by only warming the canvas cache for the default database instead of all databases
+
 ## v1.39.0 — 2026-05-27
 
 - Add Reports — a new first-class primitive for automated, scheduled research over your knowledge base. Create reports with custom research prompts, cron schedules, scoped source/context tags, and citation policies. Four curated templates ship built-in: Daily Briefing, Weekly Contradiction Scan, Open Questions Status, and Monthly Themes
