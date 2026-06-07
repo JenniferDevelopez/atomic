@@ -12,7 +12,7 @@ pub use sqlite::SqliteStorage;
 pub use traits::*;
 
 #[cfg(feature = "postgres")]
-pub use postgres::PostgresStorage;
+pub use postgres::{PgPoolConfig, PostgresStorage};
 
 use crate::error::AtomicCoreError;
 

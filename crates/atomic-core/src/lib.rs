@@ -311,6 +311,8 @@ impl AtomicCore {
         let pg_storage = PostgresStorage::connect(database_url, db_id).await?;
         pg_storage.initialize().await?;
 
+        Self::reconcile_pg_vector_index(&pg_storage).await?;
+
         let storage = storage::StorageBackend::Postgres(pg_storage);
 
         // Seed default category tags if tags table is empty
@@ -342,6 +344,69 @@ impl AtomicCore {
         };
         core.register_canvas_rebuilder();
         Ok(core)
+    }
+
+    /// Pin atom_chunks.embedding to the configured provider's dimension and
+    /// ensure the HNSW index exists. Idempotent — safe to call on every
+    /// `open_postgres`, including the second bootstrap call from
+    /// `DatabaseManager::new_postgres`. Schema is cluster-wide (not per-db_id),
+    /// so this only does real work the first time it sees a dimensionless
+    /// column or a missing index.
+    #[cfg(feature = "postgres")]
+    async fn reconcile_pg_vector_index(
+        pg: &storage::PostgresStorage,
+    ) -> Result<(), AtomicCoreError> {
+        use crate::storage::traits::{ChunkStore, SettingsStore};
+
+        let chunk_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM atom_chunks")
+            .fetch_one(pg.pool())
+            .await
+            .unwrap_or(0);
+        let current_dim = pg.get_embedding_dimension().await?;
+
+        let settings = pg.get_all_settings().await?;
+        let expected_dim = ProviderConfig::from_settings(&settings).embedding_dimension();
+
+        match current_dim {
+            Some(d) if d == expected_dim => {
+                sqlx::query(
+                    "CREATE INDEX IF NOT EXISTS atom_chunks_embedding_hnsw_idx
+                     ON atom_chunks USING hnsw (embedding vector_cosine_ops)",
+                )
+                .execute(pg.pool())
+                .await
+                .map_err(|e| {
+                    AtomicCoreError::DatabaseOperation(format!(
+                        "Failed to ensure HNSW index: {}",
+                        e
+                    ))
+                })?;
+            }
+            None if chunk_count == 0 => {
+                tracing::info!(
+                    expected_dim,
+                    "Pinning Postgres atom_chunks vector dimension and building HNSW index"
+                );
+                pg.recreate_vector_index(expected_dim).await?;
+            }
+            Some(d) => {
+                tracing::warn!(
+                    current_dim = d,
+                    expected_dim,
+                    "Postgres atom_chunks.embedding dimension does not match configured \
+                     provider; change the embedding provider setting to trigger a re-embed"
+                );
+            }
+            None => {
+                tracing::warn!(
+                    chunk_count,
+                    "Postgres atom_chunks.embedding is dimensionless with existing rows; \
+                     unable to safely reconcile dimension at startup"
+                );
+            }
+        }
+
+        Ok(())
     }
 
     /// Create an AtomicCore from an existing PostgresStorage (for multi-db in Postgres mode).

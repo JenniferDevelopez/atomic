@@ -301,6 +301,103 @@ pub async fn setup_core(backend: Backend, mock_url: &str) -> Option<CoreHandle> 
     })
 }
 
+/// Open a fresh core on either backend without seeding provider settings.
+/// Used by tests that need to exercise the no-provider failure path — the
+/// "happy path" `setup_core` plumbs a working mock provider in.
+pub async fn open_bare(backend: Backend) -> Option<CoreHandle> {
+    match backend {
+        Backend::Sqlite => {
+            let dir = TempDir::new().expect("create tempdir");
+            let core = AtomicCore::open_or_create(dir.path().join("pipeline.db"))
+                .expect("open sqlite test db");
+            Some(CoreHandle {
+                core,
+                _tempdir: Some(dir),
+            })
+        }
+        #[cfg(feature = "postgres")]
+        Backend::Postgres => {
+            let url = std::env::var("ATOMIC_TEST_DATABASE_URL").ok()?;
+            truncate_postgres_for_test(&url).await;
+            let core = AtomicCore::open_postgres(&url, "pipeline_test", None)
+                .await
+                .expect("open postgres");
+            Some(CoreHandle {
+                core,
+                _tempdir: None,
+            })
+        }
+    }
+}
+
+/// Return chunk IDs for an atom, ordered by chunk_index. Cross-backend so the
+/// same assertion ("chunks preserved across a re-embed") works against both
+/// SQLite and Postgres.
+pub async fn chunk_ids_for_atom(core: &AtomicCore, atom_id: &str) -> Vec<String> {
+    if core.database().is_some() {
+        let conn = rusqlite::Connection::open(core.db_path()).expect("open sqlite db");
+        let mut stmt = conn
+            .prepare("SELECT id FROM atom_chunks WHERE atom_id = ?1 ORDER BY chunk_index")
+            .expect("prepare chunk query");
+        stmt.query_map([atom_id], |row| row.get::<_, String>(0))
+            .expect("query chunk ids")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect chunk ids")
+    } else {
+        #[cfg(feature = "postgres")]
+        {
+            use sqlx::postgres::PgPoolOptions;
+            let url =
+                std::env::var("ATOMIC_TEST_DATABASE_URL").expect("ATOMIC_TEST_DATABASE_URL unset");
+            let pool = PgPoolOptions::new()
+                .max_connections(2)
+                .connect(&url)
+                .await
+                .expect("connect chunk-id pool");
+            let rows: Vec<(String,)> = sqlx::query_as(
+                "SELECT id FROM atom_chunks WHERE atom_id = $1 ORDER BY chunk_index",
+            )
+            .bind(atom_id)
+            .fetch_all(&pool)
+            .await
+            .expect("query chunk ids");
+            rows.into_iter().map(|(id,)| id).collect()
+        }
+        #[cfg(not(feature = "postgres"))]
+        panic!("Postgres backend reached without postgres feature");
+    }
+}
+
+/// Count rows in `atom_pipeline_jobs`. Used by tests that assert the ledger
+/// is cleared after terminal states fire.
+pub async fn pending_pipeline_job_count(core: &AtomicCore) -> i64 {
+    if core.database().is_some() {
+        let conn = rusqlite::Connection::open(core.db_path()).expect("open sqlite db");
+        conn.query_row("SELECT COUNT(*) FROM atom_pipeline_jobs", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .expect("count pipeline jobs")
+    } else {
+        #[cfg(feature = "postgres")]
+        {
+            use sqlx::postgres::PgPoolOptions;
+            let url =
+                std::env::var("ATOMIC_TEST_DATABASE_URL").expect("ATOMIC_TEST_DATABASE_URL unset");
+            let pool = PgPoolOptions::new()
+                .max_connections(2)
+                .connect(&url)
+                .await
+                .expect("connect job-count pool");
+            sqlx::query_scalar("SELECT COUNT(*) FROM atom_pipeline_jobs")
+                .fetch_one(&pool)
+                .await
+                .expect("count pipeline jobs")
+        }
+        #[cfg(not(feature = "postgres"))]
+        panic!("Postgres backend reached without postgres feature");
+    }
+}
+
 #[cfg(feature = "postgres")]
 pub async fn truncate_postgres_for_test(url: &str) {
     use sqlx::postgres::PgPoolOptions;

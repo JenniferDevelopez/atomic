@@ -637,6 +637,7 @@ dependencies = [
  "futures",
  "glob",
  "iana-time-zone",
+ "log",
  "pgvector",
  "pulldown-cmark",
  "rand 0.8.5",

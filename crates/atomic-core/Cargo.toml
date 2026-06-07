@@ -13,6 +13,9 @@ sqlite-vec = "0.1.6"
 # Database — Postgres (feature-gated)
 sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls"], optional = true }
 pgvector = { version = "0.4", features = ["sqlx"], optional = true }
+# sqlx's slow-query logging API takes `log::LevelFilter`. sqlx ≥0.7 emits the
+# events via `tracing::event!` internally, so we only need the level enum.
+log = { version = "0.4", optional = true }
 
 # Async
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
@@ -64,7 +67,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 [features]
 default = []
 openapi = ["utoipa"]
-postgres = ["sqlx", "pgvector"]
+postgres = ["sqlx", "pgvector", "log"]
 
 [dev-dependencies]
 tempfile = "3"
