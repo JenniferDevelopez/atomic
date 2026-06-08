@@ -78,7 +78,8 @@ chrono = "0.4"
 # pending Sleep deadline when the runtime has no other work.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
 sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls"] }
-# Mock HTTP server for provider-level integration tests (mimics OpenAI-compat
-# `/v1/embeddings` + `/v1/chat/completions` so tests exercise the real reqwest
-# client, request serialization, and response parsing end-to-end).
-wiremock = "0.6"
+# Shared mock OpenAI-compat server and Postgres truncation helper. The
+# `postgres` feature pulls the truncate helper in; we enable it
+# unconditionally here because atomic-core's PG suite needs it whenever the
+# `--features postgres` test job is running.
+atomic-test-support = { path = "../atomic-test-support", features = ["postgres"] }

@@ -2,32 +2,26 @@
 //!
 //! The same `Backend` switch used in atomic-core's pipeline tests runs each
 //! suite against SQLite (always) and Postgres (when `ATOMIC_TEST_DATABASE_URL`
-//! is set). Each `TestCtx` owns an `AppState` backed by the chosen store plus
-//! a freshly minted API token; `test_app(&ctx)` produces an actix-web `App`
-//! that mirrors the real server's `/api` scope (auth wrapper + full route
-//! registration).
+//! is set). Each `TestCtx` owns an `AppState` backed by the chosen store
+//! plus a freshly minted API token; `test_app(&ctx)` produces an actix-web
+//! `App` that mirrors the real server's `/api` scope (auth wrapper + full
+//! route registration). `spawn_live_server(&ctx)` binds a real port for
+//! tests that need WebSocket upgrades or concurrent HTTP load.
 //!
-//! The wiremock-backed `MockAiServer` is duplicated from
-//! `atomic-core/tests/support/mod.rs` rather than shared via a feature flag —
-//! making it a dual-purpose lib feature would pull `wiremock` into production
-//! atomic-core builds. The protocol surface (OpenAI-compat embeddings +
-//! chat/completions) is stable enough that one-time duplication is cheaper
-//! than the feature-flag plumbing.
+//! The wiremock-backed `MockAiServer` and the Postgres truncate helper live
+//! in the workspace's `atomic-test-support` crate so atomic-core and
+//! atomic-server share one implementation. This file owns only the pieces
+//! tied to atomic-server's concrete `AppState` / route shape.
 
 #![allow(dead_code)] // Helpers are per-test; not every test uses every helper.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use actix_web::{web, App};
 use atomic_core::DatabaseManager;
-use serde_json::{json, Value};
+use serde_json::Value;
 use tempfile::TempDir;
 use tokio::sync::broadcast;
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 use atomic_server::auth::BearerAuth;
 use atomic_server::export_jobs::ExportJobManager;
@@ -37,10 +31,13 @@ use atomic_server::mcp_auth::McpAuth;
 use atomic_server::routes;
 use atomic_server::state::{AppState, SetupClaimLimiter};
 
-/// Embedding dimension used by the mock. Matches the default
-/// `openai_compat_embedding_dimension` so no dimension reconciliation kicks
-/// in mid-test.
-pub const EMBED_DIM: usize = 1536;
+// Re-export the shared mock + truncate helper so test files can keep using
+// `support::MockAiServer` paths. (EMBED_DIM / EDGE_SIMILARITY_THRESHOLD are
+// available via atomic_test_support directly for any future test that wants
+// them.) `unused_imports` allowed because each integration-test binary
+// compiles this module fresh and a few binaries don't reach into the mock.
+#[allow(unused_imports)]
+pub use atomic_test_support::{truncate_postgres_for_test, MockAiServer};
 
 // ==================== Backend switch ====================
 
@@ -85,7 +82,7 @@ impl TestCtx {
             }
             Backend::Postgres => {
                 let url = std::env::var("ATOMIC_TEST_DATABASE_URL").ok()?;
-                truncate_postgres(&url).await;
+                truncate_postgres_for_test(&url).await;
                 let dir = TempDir::new().expect("create tempdir");
                 let manager = Arc::new(
                     DatabaseManager::new_postgres(dir.path(), &url)
@@ -180,200 +177,6 @@ pub fn test_app(
     )
 }
 
-// ==================== Mock AI server ====================
-
-pub struct MockAiServer {
-    server: MockServer,
-    counters: Arc<MockAiCounters>,
-}
-
-#[derive(Default)]
-struct MockAiCounters {
-    embedding_requests: AtomicUsize,
-    chat_requests: AtomicUsize,
-}
-
-impl MockAiServer {
-    pub async fn start() -> Self {
-        let server = MockServer::start().await;
-        let counters = Arc::new(MockAiCounters::default());
-
-        Mock::given(method("POST"))
-            .and(path("/v1/embeddings"))
-            .respond_with(EmbedResponder {
-                counters: counters.clone(),
-            })
-            .mount(&server)
-            .await;
-
-        Mock::given(method("POST"))
-            .and(path("/v1/chat/completions"))
-            .respond_with(ChatResponder {
-                counters: counters.clone(),
-            })
-            .mount(&server)
-            .await;
-
-        Self { server, counters }
-    }
-
-    pub fn base_url(&self) -> String {
-        self.server.uri()
-    }
-
-    pub fn embedding_request_count(&self) -> usize {
-        self.counters.embedding_requests.load(Ordering::Relaxed)
-    }
-
-    pub fn chat_request_count(&self) -> usize {
-        self.counters.chat_requests.load(Ordering::Relaxed)
-    }
-}
-
-/// Bag-of-words style unit-vector embedder. Same construction as the
-/// atomic-core test support; identical vector layout keeps cross-suite
-/// thresholds comparable.
-fn embed_text(text: &str) -> Vec<f32> {
-    let mut vec = vec![0.0f32; EMBED_DIM];
-    for word in text.split_whitespace() {
-        let normalized: String = word
-            .chars()
-            .filter(|c| c.is_alphanumeric())
-            .flat_map(|c| c.to_lowercase())
-            .collect();
-        if normalized.is_empty() {
-            continue;
-        }
-        let mut h = DefaultHasher::new();
-        normalized.hash(&mut h);
-        let idx = (h.finish() as usize) % EMBED_DIM;
-        vec[idx] += 1.0;
-    }
-    let norm: f32 = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
-    if norm > 0.0 {
-        for v in vec.iter_mut() {
-            *v /= norm;
-        }
-    } else {
-        vec[0] = 1.0;
-    }
-    vec
-}
-
-struct EmbedResponder {
-    counters: Arc<MockAiCounters>,
-}
-
-impl Respond for EmbedResponder {
-    fn respond(&self, req: &Request) -> ResponseTemplate {
-        self.counters
-            .embedding_requests
-            .fetch_add(1, Ordering::Relaxed);
-        let body: Value = match serde_json::from_slice(&req.body) {
-            Ok(v) => v,
-            Err(_) => return ResponseTemplate::new(400),
-        };
-        let Some(inputs) = body.get("input").and_then(|v| v.as_array()) else {
-            return ResponseTemplate::new(400);
-        };
-        let data: Vec<Value> = inputs
-            .iter()
-            .enumerate()
-            .map(|(index, text)| {
-                let text = text.as_str().unwrap_or_default();
-                json!({
-                    "object": "embedding",
-                    "index": index,
-                    "embedding": embed_text(text),
-                })
-            })
-            .collect();
-        ResponseTemplate::new(200).set_body_json(json!({
-            "object": "list",
-            "data": data,
-            "model": body.get("model").cloned().unwrap_or(Value::Null),
-        }))
-    }
-}
-
-struct ChatResponder {
-    counters: Arc<MockAiCounters>,
-}
-
-impl Respond for ChatResponder {
-    fn respond(&self, req: &Request) -> ResponseTemplate {
-        self.counters.chat_requests.fetch_add(1, Ordering::Relaxed);
-        let body: Value = match serde_json::from_slice(&req.body) {
-            Ok(v) => v,
-            Err(_) => return ResponseTemplate::new(400),
-        };
-
-        let schema_name = body
-            .pointer("/response_format/json_schema/name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let request_text = body.to_string().to_lowercase();
-
-        let content = match schema_name {
-            "extraction_result" => {
-                let tag_name = if request_text.contains("biology") {
-                    "Biology"
-                } else if request_text.contains("cooking") || request_text.contains("pasta") {
-                    "Cooking"
-                } else {
-                    "Physics"
-                };
-                json!({
-                    "tags": [
-                        { "name": tag_name, "parent_name": "Topics" },
-                    ]
-                })
-                .to_string()
-            }
-            _ => "{}".to_string(),
-        };
-
-        ResponseTemplate::new(200).set_body_json(json!({
-            "id": "mock-cmpl",
-            "object": "chat.completion",
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": content,
-                    },
-                    "finish_reason": "stop",
-                }
-            ],
-        }))
-    }
-}
-
-// ==================== Postgres truncate ====================
-
-/// Truncate per-DB tables on the shared Postgres test instance. Matches the
-/// list used in atomic-core/tests/storage_tests.rs and pipeline support.
-pub async fn truncate_postgres(url: &str) {
-    use sqlx::postgres::PgPoolOptions;
-    let pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(url)
-        .await
-        .expect("connect truncate pool");
-    let _ = sqlx::raw_sql(
-        "TRUNCATE atoms, tags, atom_tags, atom_chunks, atom_positions, atom_pipeline_jobs, \
-         semantic_edges, atom_clusters, tag_embeddings, \
-         wiki_articles, wiki_citations, wiki_links, wiki_article_versions, atom_links, \
-         conversations, conversation_tags, chat_messages, chat_tool_calls, chat_citations, \
-         feeds, feed_tags, feed_items, settings, \
-         briefing_citations, briefings, oauth_codes, oauth_clients, api_tokens \
-         CASCADE",
-    )
-    .execute(&pool)
-    .await;
-}
-
 // ==================== Real-port test server ====================
 
 /// Handle to a `HttpServer` running on an ephemeral port. Drop the handle (or
@@ -390,13 +193,15 @@ impl LiveServer {
 }
 
 /// Start a real `HttpServer` on `127.0.0.1:0` mirroring the production route
-/// table (`/api` scope behind `BearerAuth`, plus the public `/ws` endpoint).
-/// The returned `base_url` points at the bound port; the server runs on its
-/// own tokio task until the handle is stopped.
+/// table (`/api` scope behind `BearerAuth`, plus the public `/ws` endpoint
+/// and the `/mcp` scope behind `McpAuth`). The returned `base_url` points
+/// at the bound port; the server runs on its own tokio task until the
+/// handle is stopped.
 ///
-/// Used by the WebSocket and concurrent-storm suites that need a real TCP
-/// listener — `actix_web::test::init_service` is in-process only and can't
-/// satisfy `actix-ws`'s upgrade response or model real concurrent HTTP load.
+/// Used by the WebSocket, MCP, and concurrent-storm suites that need a
+/// real TCP listener — `actix_web::test::init_service` is in-process only
+/// and can't satisfy `actix-ws`'s upgrade response or model real concurrent
+/// HTTP load.
 pub async fn spawn_live_server(ctx: &TestCtx) -> LiveServer {
     use actix_web::{web, App, HttpServer};
     use std::time::Duration;
