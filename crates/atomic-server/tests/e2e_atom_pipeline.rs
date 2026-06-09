@@ -68,8 +68,10 @@ async fn run_create_atom_runs_full_pipeline(backend: Backend) {
         "mock embedding endpoint should have been hit"
     );
 
-    // Auto-tagging should run after embedding completes and apply a content-
-    // derived tag (the ChatResponder picks Physics by default).
+    // Auto-tagging fires after embedding completes. `embedding_status =
+    // complete` is reached before the tagger writes its rows, so the
+    // tags-array check needs to wait on `tagging_status` separately.
+    let final_body = support::poll_until_tagging_done(&app, ctx.auth_header(), &atom_id).await;
     let tags = final_body["tags"]
         .as_array()
         .expect("atom response has tags array")

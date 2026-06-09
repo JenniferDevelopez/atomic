@@ -25,11 +25,13 @@
 //! `tests/support/mod.rs`.
 
 pub mod mock_ai;
+pub mod mock_url;
 
 #[cfg(feature = "postgres")]
 pub mod postgres_helpers;
 
 pub use mock_ai::{MockAiServer, EDGE_SIMILARITY_THRESHOLD, EMBED_DIM};
+pub use mock_url::MockUrlServer;
 
 #[cfg(feature = "postgres")]
 pub use postgres_helpers::truncate_postgres_for_test;

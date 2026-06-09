@@ -128,6 +128,154 @@ fn embed_text(text: &str) -> Vec<f32> {
     vec
 }
 
+/// Build a streaming `chat/completions` response. Detects whether the agent
+/// is on its first turn (no prior tool results) or has tool results in its
+/// message log, and emits the matching SSE stream:
+///
+/// - First turn: a single `tool_calls` delta requesting `search_atoms` with
+///   a query plucked from the most recent user message. Closes with
+///   `finish_reason: tool_calls`.
+/// - Tool results present: a single content delta with deterministic text,
+///   closes with `finish_reason: stop`.
+///
+/// The provider parser is line-oriented (`data: ...\n`) and accepts the
+/// stream as a single body payload, so we don't need true chunked transfer
+/// to satisfy it.
+fn streaming_chat_response(body: &Value) -> ResponseTemplate {
+    let has_tool_results = body
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .map(|msgs| {
+            msgs.iter()
+                .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+        })
+        .unwrap_or(false);
+
+    let sse_body = if has_tool_results {
+        // Second leg: agent has tool results, emit final assistant text.
+        let chunks = [
+            json!({
+                "choices": [{
+                    "delta": { "content": "Mock assistant reply grounded in the search results." },
+                    "finish_reason": null,
+                }]
+            }),
+            json!({
+                "choices": [{
+                    "delta": {},
+                    "finish_reason": "stop",
+                }]
+            }),
+        ];
+        sse_concat(&chunks)
+    } else {
+        // First leg: ask the runtime to run `search_atoms`. The query is
+        // lifted from the most recent user message so the search hits the
+        // seeded atoms verbatim.
+        let query = latest_user_query(body).unwrap_or_else(|| "atomic".to_string());
+        let arguments = json!({ "query": query, "limit": 5 }).to_string();
+        let chunks = [
+            json!({
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_mock_search",
+                            "type": "function",
+                            "function": {
+                                "name": "search_atoms",
+                                "arguments": arguments,
+                            }
+                        }]
+                    },
+                    "finish_reason": null,
+                }]
+            }),
+            json!({
+                "choices": [{
+                    "delta": {},
+                    "finish_reason": "tool_calls",
+                }]
+            }),
+        ];
+        sse_concat(&chunks)
+    };
+
+    ResponseTemplate::new(200)
+        .insert_header("Content-Type", "text/event-stream")
+        .set_body_raw(sse_body.into_bytes(), "text/event-stream")
+}
+
+fn sse_concat(chunks: &[Value]) -> String {
+    let mut out = String::new();
+    for chunk in chunks {
+        out.push_str("data: ");
+        out.push_str(&chunk.to_string());
+        out.push_str("\n\n");
+    }
+    out.push_str("data: [DONE]\n\n");
+    out
+}
+
+fn latest_user_query(body: &Value) -> Option<String> {
+    let messages = body.get("messages")?.as_array()?;
+    for msg in messages.iter().rev() {
+        if msg.get("role").and_then(|v| v.as_str()) == Some("user") {
+            return msg
+                .get("content")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+    }
+    None
+}
+
+/// Count `[N]` markers in the LLM request's user message — used by the
+/// wiki-generation responder to figure out how many numbered sources were
+/// embedded in the prompt so it can cite at least one of them.
+fn count_numbered_sources(body: &Value) -> i32 {
+    let mut max_seen = 0i32;
+    if let Some(messages) = body.get("messages").and_then(|v| v.as_array()) {
+        for msg in messages {
+            if let Some(content) = msg.get("content").and_then(|v| v.as_str()) {
+                for cap in content.split('[').skip(1) {
+                    if let Some(end) = cap.find(']') {
+                        if let Ok(n) = cap[..end].parse::<i32>() {
+                            if n > max_seen {
+                                max_seen = n;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    max_seen
+}
+
+/// Wiki incremental updates label new sources with indices that start
+/// strictly *after* the existing citations. Recover that starting index
+/// from the prompt — it's the first marker following the
+/// `NEW SOURCES TO INCORPORATE (cite as [N]` substring.
+fn first_new_source_index(body: &Value) -> Option<i32> {
+    let messages = body.get("messages")?.as_array()?;
+    for msg in messages {
+        if let Some(content) = msg.get("content").and_then(|v| v.as_str()) {
+            // The prompt text explicitly tells the LLM where new sources
+            // start: "NEW SOURCES TO INCORPORATE (cite as [N] onwards)".
+            if let Some(anchor) = content.find("NEW SOURCES TO INCORPORATE (cite as [") {
+                let tail = &content[anchor + "NEW SOURCES TO INCORPORATE (cite as [".len()..];
+                if let Some(end) = tail.find(']') {
+                    if let Ok(n) = tail[..end].parse::<i32>() {
+                        return Some(n);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 struct EmbedResponder {
     counters: Arc<MockAiCounters>,
 }
@@ -176,6 +324,55 @@ impl Respond for ChatResponder {
             Err(_) => return ResponseTemplate::new(400),
         };
 
+        // Streaming chat (agent loop). Detected by `stream: true` plus a
+        // `tools` array — the chat agent always sends tools, while wiki /
+        // tagging only stream when explicitly enabled (they don't, today).
+        // Branch on whether the message log already contains tool results:
+        //   - no tool results yet → emit a tool_calls SSE that requests
+        //     `search_atoms`.
+        //   - tool results present → emit a final text-content SSE.
+        let is_streaming = body
+            .get("stream")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let has_tools = body
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .map(|t| !t.is_empty())
+            .unwrap_or(false);
+        if is_streaming && has_tools {
+            return streaming_chat_response(&body);
+        }
+
+        // Non-streaming chat with tools — used by the reports agentic loop.
+        // The agent expects either a tool call (research) or a content
+        // response with no tool calls (loop terminator). We short-circuit
+        // by calling `done` immediately, which keeps the research phase
+        // out of the report e2e tests (search-based tool flow is already
+        // covered by slice 3c's chat suite).
+        if !is_streaming && has_tools {
+            return ResponseTemplate::new(200).set_body_json(json!({
+                "id": "mock-cmpl",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": "call_done",
+                            "type": "function",
+                            "function": {
+                                "name": "done",
+                                "arguments": "{}"
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            }));
+        }
+
         // Inspect the requested schema name so this responder can serve
         // more than just tag extraction as the test matrix grows.
         let schema_name = body
@@ -197,6 +394,97 @@ impl Respond for ChatResponder {
                     "tags": [
                         { "name": tag_name, "parent_name": "Topics" },
                     ]
+                })
+                .to_string()
+            }
+            // Wiki full-article generation. The wiki prompt embeds source
+            // chunks as `[1] excerpt...\n[2] excerpt...\n` etc.; the
+            // citation extractor parses `\[(\d+)\]` against that source
+            // list.
+            //
+            // The legacy `update_wiki` path reuses this schema for a full
+            // rewrite. Detect the update prompt shape ("NEW SOURCES TO
+            // INCORPORATE") and emit a *different* body that pins the new
+            // source index — otherwise the update returns content
+            // byte-identical to the original generation and tests can't
+            // distinguish the two.
+            "wiki_generation_result" => {
+                let n = count_numbered_sources(&body);
+                if let Some(new_index) = first_new_source_index(&body) {
+                    // Update path: cite the new source so the test can
+                    // verify the freshly added atom is integrated.
+                    json!({
+                        "article_content": format!(
+                            "# Mock Wiki\n\nUpdated article body integrating new source. [1] [{new_index}]"
+                        ),
+                        "citations_used": [1, new_index],
+                    })
+                    .to_string()
+                } else {
+                    let cited: Vec<i32> = (1..=n.min(2).max(1)).collect();
+                    let markers = cited
+                        .iter()
+                        .map(|i| format!("[{i}]"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    json!({
+                        "article_content": format!(
+                            "# Mock Wiki\n\nThis is a deterministic mock article body. {markers}"
+                        ),
+                        "citations_used": cited,
+                    })
+                    .to_string()
+                }
+            }
+            // Tag compaction. The route hands the LLM a flat list of
+            // tag rows (`tag_id | name | parent_name | atom_count`). We
+            // emit a single merge of the conventional test tag pair
+            // ("MockLoser" → "MockWinner") when both names appear in the
+            // prompt; otherwise return an empty array so the route
+            // reports `tags_merged: 0` without touching real data.
+            "merge_result" => {
+                if request_text.contains("mockwinner") && request_text.contains("mockloser") {
+                    json!({
+                        "merges": [{
+                            "winner_name": "MockWinner",
+                            "loser_name": "MockLoser",
+                            "reason": "Deterministic mock merge for the compaction test."
+                        }]
+                    })
+                    .to_string()
+                } else {
+                    json!({ "merges": [] }).to_string()
+                }
+            }
+            // Report final pass. The agent embeds source atoms as
+            // `Source [N]: ...` blocks; cite the first one and
+            // `extract_citations` resolves the marker against the citables
+            // table so the finding atom gets a non-empty citation row.
+            "report_generation_result" => {
+                json!({
+                    "finding_content": "# Mock Finding\n\nA deterministic mock finding body. [1]",
+                    "citations_used": [1],
+                })
+                .to_string()
+            }
+            // Wiki incremental update: emit a single AppendToSection op
+            // pinned to the heading the existing article uses, referencing
+            // the first new-source index. Tests assert that the update
+            // resolves a citation pointing at the freshly added atom.
+            "wiki_update_section_ops" => {
+                let new_index = first_new_source_index(&body).unwrap_or(2);
+                json!({
+                    "operations": [
+                        {
+                            "op": "AppendToSection",
+                            "heading": "Mock Wiki",
+                            "after_heading": "",
+                            "content": format!(
+                                "Additional mock context referencing the new source. [{new_index}]"
+                            ),
+                        }
+                    ],
+                    "citations_used": [new_index],
                 })
                 .to_string()
             }

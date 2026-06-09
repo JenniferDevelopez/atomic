@@ -37,7 +37,7 @@ use atomic_server::state::{AppState, SetupClaimLimiter};
 // them.) `unused_imports` allowed because each integration-test binary
 // compiles this module fresh and a few binaries don't reach into the mock.
 #[allow(unused_imports)]
-pub use atomic_test_support::{truncate_postgres_for_test, MockAiServer};
+pub use atomic_test_support::{truncate_postgres_for_test, MockAiServer, MockUrlServer};
 
 // ==================== Backend switch ====================
 
@@ -65,11 +65,47 @@ pub struct TestCtx {
     pub mock: Arc<MockAiServer>,
 }
 
+/// Build options for `TestCtx::new_with`. Defaults match the values used
+/// by `TestCtx::new` so the no-knobs path stays one line.
+pub struct TestCtxOptions {
+    /// When true (the default), mints an initial API token and seeds the
+    /// `ctx.token` field. Setup tests pass `false` so the instance is
+    /// genuinely unclaimed when the test starts.
+    pub mint_initial_token: bool,
+    /// Sets `AppState::public_url`. OAuth endpoints early-return 404 when
+    /// this is `None`; the OAuth tests pass `Some(<server base url>)`.
+    pub public_url: Option<String>,
+    /// Sets `AppState::dangerously_skip_setup_token`. Setup token tests
+    /// flip this to exercise the token-required branch.
+    pub dangerously_skip_setup_token: bool,
+    /// Sets `AppState::setup_token`. Tests that exercise the setup token
+    /// branch pass a known value here.
+    pub setup_token: Option<atomic_server::state::SetupToken>,
+}
+
+impl Default for TestCtxOptions {
+    fn default() -> Self {
+        Self {
+            mint_initial_token: true,
+            public_url: None,
+            dangerously_skip_setup_token: true,
+            setup_token: None,
+        }
+    }
+}
+
 impl TestCtx {
     /// Build a fresh test context on the chosen backend. Returns `None` when
     /// the Postgres URL is unset so individual tests can skip cleanly rather
     /// than failing on a missing env var.
     pub async fn new(backend: Backend) -> Option<Self> {
+        Self::new_with(backend, TestCtxOptions::default()).await
+    }
+
+    /// Like [`new`] but with explicit options so OAuth/setup tests can
+    /// flip `public_url`, `mint_initial_token`, and the setup-token gate
+    /// without forking the whole constructor.
+    pub async fn new_with(backend: Backend, opts: TestCtxOptions) -> Option<Self> {
         let mock = Arc::new(MockAiServer::start().await);
 
         let (manager, temp) = match backend {
@@ -113,10 +149,19 @@ impl TestCtx {
             .await
             .expect("configure autotag targets");
 
-        let (_info, raw_token) = core
-            .create_api_token("e2e-test")
-            .await
-            .expect("mint api token");
+        let raw_token = if opts.mint_initial_token {
+            let (_info, raw_token) = core
+                .create_api_token("e2e-test")
+                .await
+                .expect("mint api token");
+            raw_token
+        } else {
+            // Setup tests need a *truly* unclaimed instance — `claim_instance`
+            // refuses to run if any token exists. The `token` field is left
+            // empty; tests that need auth after claiming should mint a token
+            // through the claim flow itself.
+            String::new()
+        };
 
         let temp_for_exports = temp
             .as_ref()
@@ -126,11 +171,11 @@ impl TestCtx {
         let state = web::Data::new(AppState {
             manager,
             event_tx,
-            public_url: None,
+            public_url: opts.public_url,
             log_buffer: LogBuffer::new(16),
             export_jobs: ExportJobManager::for_tests(temp_for_exports.join("exports")),
-            setup_token: None,
-            dangerously_skip_setup_token: true,
+            setup_token: opts.setup_token,
+            dangerously_skip_setup_token: opts.dangerously_skip_setup_token,
             setup_claim_lock: tokio::sync::Mutex::new(()),
             setup_claim_limiter: SetupClaimLimiter::new(),
         });
@@ -175,6 +220,85 @@ pub fn test_app(
             })
             .configure(routes::configure_routes),
     )
+}
+
+/// Like [`spawn_live_server`] but also mounts the public (no-auth) routes
+/// the OAuth + setup flow needs: `/oauth/register`, `/oauth/authorize`
+/// (GET + POST), `/oauth/token`, and `/api/setup/*`. The MCP and WS
+/// endpoints are still attached so callers can mix-and-match.
+pub async fn spawn_live_server_with_public_routes(ctx: &TestCtx) -> LiveServer {
+    use actix_web::{web, App, HttpServer};
+    use std::time::Duration;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    let base_url = format!("http://{}", addr);
+
+    let mcp_transport = AtomicMcpTransport::new(
+        std::sync::Arc::clone(&ctx.state.manager),
+        ctx.state.event_tx.clone(),
+        Duration::from_secs(30),
+    );
+
+    let state_for_factory = ctx.state.clone();
+    let server = HttpServer::new(move || {
+        let state = state_for_factory.clone();
+        App::new()
+            .app_data(state.clone())
+            .route("/ws", web::get().to(atomic_server::ws::ws_handler))
+            // OAuth public flow — these endpoints check `state.public_url`
+            // themselves and 404 when it's unset, which is why
+            // `TestCtxOptions::public_url` must be populated.
+            .route(
+                "/oauth/register",
+                web::post().to(atomic_server::routes::oauth::register),
+            )
+            .route(
+                "/oauth/authorize",
+                web::get().to(atomic_server::routes::oauth::authorize_page),
+            )
+            .route(
+                "/oauth/authorize",
+                web::post().to(atomic_server::routes::oauth::authorize_approve),
+            )
+            .route(
+                "/oauth/token",
+                web::post().to(atomic_server::routes::oauth::token),
+            )
+            // Setup endpoints — public, gated by the token state of the
+            // active DB rather than bearer auth.
+            .route(
+                "/api/setup/status",
+                web::get().to(atomic_server::routes::setup::setup_status),
+            )
+            .route(
+                "/api/setup/claim",
+                web::post().to(atomic_server::routes::setup::claim_instance),
+            )
+            .service(
+                web::scope("/mcp")
+                    .wrap(McpAuth {
+                        state: state.clone(),
+                    })
+                    .service(mcp_transport.clone().scope()),
+            )
+            .service(
+                web::scope("/api")
+                    .wrap(BearerAuth {
+                        state: state.clone(),
+                    })
+                    .configure(routes::configure_routes),
+            )
+    })
+    .workers(1)
+    .listen(listener)
+    .expect("attach listener")
+    .run();
+
+    let handle = server.handle();
+    actix_web::rt::spawn(server);
+
+    LiveServer { base_url, handle }
 }
 
 // ==================== Real-port test server ====================
@@ -224,6 +348,14 @@ pub async fn spawn_live_server(ctx: &TestCtx) -> LiveServer {
         App::new()
             .app_data(state.clone())
             .route("/ws", web::get().to(atomic_server::ws::ws_handler))
+            // Export download is intentionally public (one-time token in
+            // the query string) and lives outside the bearer scope in
+            // `main.rs`. The e2e harness mirrors that layout so the
+            // export tests can follow `download_path` without auth.
+            .route(
+                "/api/exports/{id}/download",
+                web::get().to(atomic_server::routes::exports::download_export),
+            )
             .service(
                 web::scope("/mcp")
                     .wrap(McpAuth {
@@ -252,6 +384,60 @@ pub async fn spawn_live_server(ctx: &TestCtx) -> LiveServer {
 
 // ==================== Pipeline poller ====================
 
+// ==================== WS event collector ====================
+
+/// Collect WS events from `ws` until `predicate(&event)` returns true, or
+/// `deadline` elapses. Skips non-text frames (ping/pong/binary). Panics on a
+/// clean Close (server hanging up mid-test is a real failure signal). Returns
+/// the matched event so callers can assert on it further.
+///
+/// Shared between the WS pipeline test and the chat tests because both wait
+/// for "some predicate over a stream of JSON frames" — putting the loop in
+/// one place keeps the test bodies small enough to read end-to-end without
+/// scrolling.
+pub async fn collect_ws_event_until<F, S>(
+    ws: &mut S,
+    deadline: std::time::Duration,
+    mut predicate: F,
+) -> serde_json::Value
+where
+    F: FnMut(&serde_json::Value) -> bool,
+    S: futures_util::Stream<
+            Item = Result<
+                tokio_tungstenite::tungstenite::Message,
+                tokio_tungstenite::tungstenite::Error,
+            >,
+        > + Unpin,
+{
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let stop_at = tokio::time::Instant::now() + deadline;
+    loop {
+        let remaining = stop_at.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            panic!("ws predicate did not match within {deadline:?}");
+        }
+        let msg = tokio::time::timeout(remaining, ws.next())
+            .await
+            .expect("ws recv timeout")
+            .expect("ws stream ended")
+            .expect("ws frame");
+        let text = match msg {
+            Message::Text(t) => t.to_string(),
+            Message::Binary(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {
+                continue
+            }
+            Message::Close(_) => panic!("server closed the ws connection mid-test"),
+        };
+        let event: serde_json::Value =
+            serde_json::from_str(&text).expect("ws frame is JSON");
+        if predicate(&event) {
+            return event;
+        }
+    }
+}
+
 /// Poll `GET /api/atoms/{id}` until `embedding_status` reaches a terminal
 /// state (`complete` or `failed`). Returns the parsed atom body. The mock
 /// embedder responds instantly, but the pipeline runs on a background tokio
@@ -260,6 +446,43 @@ pub async fn poll_until_embedding_done<S, B>(
     app: &S,
     auth: (&'static str, String),
     atom_id: &str,
+) -> Value
+where
+    S: actix_web::dev::Service<
+        actix_http::Request,
+        Response = actix_web::dev::ServiceResponse<B>,
+        Error = actix_web::Error,
+    >,
+    B: actix_web::body::MessageBody,
+{
+    poll_until_atom_status(app, auth, atom_id, "embedding_status").await
+}
+
+/// Wait until the atom's tagging stage hits a terminal state. Auto-tagging
+/// runs *after* embedding completes, so checks against the `tags` array
+/// must gate on this rather than `embedding_status` — otherwise the test
+/// races the background tagger and sometimes sees an empty `tags` list.
+pub async fn poll_until_tagging_done<S, B>(
+    app: &S,
+    auth: (&'static str, String),
+    atom_id: &str,
+) -> Value
+where
+    S: actix_web::dev::Service<
+        actix_http::Request,
+        Response = actix_web::dev::ServiceResponse<B>,
+        Error = actix_web::Error,
+    >,
+    B: actix_web::body::MessageBody,
+{
+    poll_until_atom_status(app, auth, atom_id, "tagging_status").await
+}
+
+async fn poll_until_atom_status<S, B>(
+    app: &S,
+    auth: (&'static str, String),
+    atom_id: &str,
+    field: &'static str,
 ) -> Value
 where
     S: actix_web::dev::Service<
@@ -280,13 +503,15 @@ where
         let resp = actix_test::call_service(app, req).await;
         assert_eq!(resp.status(), 200, "atom should exist while polling");
         let body: Value = actix_test::read_body_json(resp).await;
-        let status = body["embedding_status"].as_str().unwrap_or("");
-        if status == "complete" || status == "failed" {
+        let status = body[field].as_str().unwrap_or("");
+        // `skipped` is a terminal state too — e.g. when an atom is too short
+        // to tag, the pipeline marks tagging skipped rather than complete.
+        if matches!(status, "complete" | "failed" | "skipped") {
             return body;
         }
         if std::time::Instant::now() >= deadline {
             panic!(
-                "embedding did not reach terminal state for {atom_id} within 15s; \
+                "{field} did not reach terminal state for {atom_id} within 15s; \
                  last status = {status:?}"
             );
         }
