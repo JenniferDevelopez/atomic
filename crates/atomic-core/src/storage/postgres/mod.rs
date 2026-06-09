@@ -229,6 +229,10 @@ impl PostgresStorage {
                 19,
                 include_str!("migrations/019_atom_chunks_hnsw_index.sql"),
             ),
+            (
+                20,
+                include_str!("migrations/020_atom_positions_double.sql"),
+            ),
         ];
 
         // Advisory lock key — arbitrary fixed i64 to serialize migrations
