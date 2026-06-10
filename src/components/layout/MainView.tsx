@@ -12,6 +12,8 @@ import {
   Search,
   Filter,
   Telescope,
+  Moon,
+  Sun,
 } from 'lucide-react';
 import { motion, LayoutGroup } from 'motion/react';
 import { AtomGrid } from '../atoms/AtomGrid';
@@ -29,10 +31,71 @@ import { ReportsFullView, ReportDetailView, FindingReader } from '../reports';
 import { ChatViewer } from '../chat/ChatViewer';
 import { TabStrip } from './TabStrip';
 import { useAtomsStore } from '../../stores/atoms';
+import { useSettingsStore } from '../../stores/settings';
 import { useUIStore } from '../../stores/ui';
 import { isTauri } from '../../lib/platform';
-import { useIsMobile } from '../../hooks';
+import { useIsMobile, useTheme } from '../../hooks';
 import { readerEditorActions } from '../../lib/reader-editor-bridge';
+
+const PAPERBOY_RETURN_URL =
+  import.meta.env.VITE_PAPERBOY_RETURN_URL ||
+  'https://paperboy.internal.yassineraddahi.com/paperboy';
+
+function PaperboyLogoLink() {
+  return (
+    <a
+      data-paperboy-logo-link
+      href={PAPERBOY_RETURN_URL}
+      aria-label="Back to Paperboy"
+      title="Back to Paperboy"
+      className="no-drag flex h-9 w-9 shrink-0 items-center justify-center rounded-md text-[var(--color-accent)] transition-colors hover:bg-[var(--color-bg-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--color-bg-main)]"
+    >
+      <img
+        src="/paperboy-logo.svg"
+        alt=""
+        className="h-7 w-7"
+        draggable={false}
+      />
+    </a>
+  );
+}
+
+function AtomicThemeToggle() {
+  const theme = useTheme();
+  const settingsLoaded = useSettingsStore((s) => Object.keys(s.settings).length > 0);
+  const settingsLoading = useSettingsStore((s) => s.isLoading);
+  const fetchSettings = useSettingsStore((s) => s.fetchSettings);
+  const setSetting = useSettingsStore((s) => s.setSetting);
+  const isLight = theme === 'liquid-glass';
+
+  useEffect(() => {
+    if (!settingsLoaded && !settingsLoading) {
+      void fetchSettings();
+    }
+  }, [fetchSettings, settingsLoaded, settingsLoading]);
+
+  const handleToggleTheme = useCallback(() => {
+    const nextTheme = isLight ? 'obsidian' : 'liquid-glass';
+    void setSetting('theme', nextTheme).catch((error) => {
+      console.error('Failed to toggle theme:', error);
+    });
+  }, [isLight, setSetting]);
+
+  const Icon = isLight ? Sun : Moon;
+
+  return (
+    <button
+      data-atomic-theme-toggle
+      type="button"
+      onClick={handleToggleTheme}
+      aria-label="Toggle theme"
+      title={isLight ? 'Switch to dark mode' : 'Switch to light mode'}
+      className="p-1.5 rounded-md text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-hover)] transition-colors shrink-0"
+    >
+      <Icon className="w-4 h-4" strokeWidth={2} />
+    </button>
+  );
+}
 
 export function MainView() {
   const atoms = useAtomsStore(s => s.atoms);
@@ -244,18 +307,7 @@ export function MainView() {
         data-tauri-drag-region
         className={`h-[52px] flex items-center gap-3 px-4 flex-shrink-0 drag-region ${!leftPanelOpen && isTauri() ? 'pl-[78px]' : ''}`}
       >
-        {/* Left sidebar toggle — always visible */}
-        <button
-          onClick={toggleLeftPanel}
-          className={`p-1.5 rounded-md transition-colors ${
-            leftPanelOpen
-              ? 'text-[var(--color-text-primary)] hover:bg-[var(--color-bg-hover)]'
-              : 'text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-hover)]'
-          }`}
-          title={leftPanelOpen ? "Hide sidebar" : "Show sidebar"}
-        >
-          <PanelLeft className="w-4 h-4" strokeWidth={2} />
-        </button>
+        <PaperboyLogoLink />
 
         {/* Main nav + tabs share a single LayoutGroup so the accent blob
             (Motion `layoutId="active-tab-blob"`) can FLIP between any
@@ -263,57 +315,83 @@ export function MainView() {
             a continuous slide instead of a fade-swap when the user
             changes views. */}
         <LayoutGroup>
-          {!isMobile && (
-            <div className="flex items-center gap-1 shrink-0">
-              {([
-                ['dashboard', LayoutDashboard, 'Dashboard'],
-                ['atoms', Library, 'Atoms'],
-                ['canvas', Network, 'Canvas view'],
-                ['wiki', BookOpen, 'Wiki view'],
-                ['reports', Telescope, 'Reports'],
-              ] as const).map(([mode, IconCmp, label]) => {
-                const isActiveNav = onBaseView && viewMode === mode;
-                return (
-                  <button
-                    key={mode}
-                    onClick={() => setViewMode(mode)}
-                    className={`relative p-1.5 rounded-md ${
-                      isActiveNav
-                        ? 'text-white'
-                        : 'text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-hover)] transition-colors'
-                    }`}
-                    title={label}
-                    aria-label={label}
-                  >
-                    {isActiveNav && (
-                      <motion.div
-                        layoutId="active-tab-blob"
-                        className="absolute inset-0 bg-[var(--color-accent)] rounded-md shadow-sm"
-                        transition={{ type: 'spring', stiffness: 520, damping: 32, mass: 0.9 }}
-                      />
-                    )}
-                    <IconCmp className="relative z-[1] w-4 h-4" strokeWidth={2} />
-                  </button>
-                );
-              })}
-            </div>
-          )}
-
-          {/* Search button — find-in-note when an atom tab is active, else palette. */}
-          <button
-            onClick={handleOpenSearch}
-            className="p-1.5 rounded-md text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-hover)] transition-colors shrink-0"
-            title={readerState.atomId ? 'Find in note' : 'Search atoms'}
+          {/* Tab strip — remains the primary chip next to the Paperboy mark. */}
+          <div
+            data-atomic-tab-strip-anchor
+            className="min-w-0 max-w-[38vw] sm:max-w-[46vw] xl:max-w-[620px] flex items-center overflow-hidden"
           >
-            <Search className="w-4 h-4" strokeWidth={2} />
-          </button>
-
-          {/* Tab strip — pills sit immediately to the right of search and
-              consume any unused horizontal space. */}
-          <div className="flex-1 min-w-0 flex items-center">
             <TabStrip />
           </div>
+
+          <div
+            data-atomic-toolbar-actions
+            className="no-drag flex items-center gap-1 shrink-0"
+          >
+            {/* Left sidebar toggle — moved beside the active tab. */}
+            <button
+              onClick={toggleLeftPanel}
+              className={`p-1.5 rounded-md transition-colors ${
+                leftPanelOpen
+                  ? 'text-[var(--color-text-primary)] hover:bg-[var(--color-bg-hover)]'
+                  : 'text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-hover)]'
+              }`}
+              title={leftPanelOpen ? "Hide sidebar" : "Show sidebar"}
+              aria-label={leftPanelOpen ? "Hide sidebar" : "Show sidebar"}
+            >
+              <PanelLeft className="w-4 h-4" strokeWidth={2} />
+            </button>
+
+            {!isMobile && (
+              <div className="flex items-center gap-1 shrink-0">
+                {([
+                  ['dashboard', LayoutDashboard, 'Dashboard'],
+                  ['atoms', Library, 'Atoms'],
+                  ['canvas', Network, 'Canvas view'],
+                  ['wiki', BookOpen, 'Wiki view'],
+                  ['reports', Telescope, 'Reports'],
+                ] as const).map(([mode, IconCmp, label]) => {
+                  const isActiveNav = onBaseView && viewMode === mode;
+                  return (
+                    <button
+                      key={mode}
+                      onClick={() => setViewMode(mode)}
+                      className={`relative p-1.5 rounded-md ${
+                        isActiveNav
+                          ? 'text-white'
+                          : 'text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-hover)] transition-colors'
+                      }`}
+                      title={label}
+                      aria-label={label}
+                    >
+                      {isActiveNav && (
+                        <motion.div
+                          layoutId="active-tab-blob"
+                          className="absolute inset-0 bg-[var(--color-accent)] rounded-md shadow-sm"
+                          transition={{ type: 'spring', stiffness: 520, damping: 32, mass: 0.9 }}
+                        />
+                      )}
+                      <IconCmp className="relative z-[1] w-4 h-4" strokeWidth={2} />
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Search button — find-in-note when an atom tab is active, else palette. */}
+            <button
+              onClick={handleOpenSearch}
+              className="p-1.5 rounded-md text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-hover)] transition-colors shrink-0"
+              title={readerState.atomId ? 'Find in note' : 'Search atoms'}
+              aria-label={readerState.atomId ? 'Find in note' : 'Search atoms'}
+            >
+              <Search className="w-4 h-4" strokeWidth={2} />
+            </button>
+
+            <AtomicThemeToggle />
+          </div>
         </LayoutGroup>
+
+        <div className="flex-1 min-w-0" />
 
         {/* Save status — visible whenever an atom tab is active and saving */}
         {readerState.atomId && readerState.saveStatus !== 'idle' && (

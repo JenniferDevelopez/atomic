@@ -47,33 +47,44 @@
 
 /* Theme Definitions */
 :root {
-  /* Obsidian Theme (Default) */
-  --color-bg-main: #1e1e1e;
-  --color-bg-panel: #252525;
-  --color-bg-card: #2d2d2d;
-  --color-bg-elevated: #2d2d2d;
-  --color-bg-hover: #3d3d3d;
+  /* Paperboy-aligned dark theme (Default / Obsidian) */
+  --paperboy-bg: #090a0f;
+  --paperboy-surface: #111217;
+  --paperboy-surface-raised: #181920;
+  --paperboy-surface-muted: #20222a;
+  --paperboy-border: #2d3038;
+  --paperboy-border-strong: #3f4350;
+  --paperboy-purple: #8b5cf6;
+  --paperboy-purple-bright: #a78bfa;
+  --paperboy-text: #f4f4f5;
+  --paperboy-muted: #a1a1aa;
+
+  --color-bg-main: var(--paperboy-bg);
+  --color-bg-panel: var(--paperboy-surface);
+  --color-bg-card: var(--paperboy-surface-muted);
+  --color-bg-elevated: var(--paperboy-surface-raised);
+  --color-bg-hover: #262832;
   
-  --color-text-primary: #dcddde;
-  --color-text-secondary: #888888;
-  --color-text-tertiary: #666666;
+  --color-text-primary: var(--paperboy-text);
+  --color-text-secondary: var(--paperboy-muted);
+  --color-text-tertiary: #71717a;
   
-  --color-border: #3d3d3d;
-  --color-border-hover: #4d4d4d;
+  --color-border: var(--paperboy-border);
+  --color-border-hover: var(--paperboy-border-strong);
   
-  --color-accent: #7c3aed;
-  --color-accent-rgb: 124 58 237;
-  --color-accent-hover: #6d28d9;
-  --color-accent-light: #a78bfa;
-  --color-accent-alpha: rgba(124, 58, 237, 0.2);
+  --color-accent: var(--paperboy-purple);
+  --color-accent-rgb: 139 92 246;
+  --color-accent-hover: var(--paperboy-purple-bright);
+  --color-accent-light: #c4b5fd;
+  --color-accent-alpha: rgba(139, 92, 246, 0.2);
   
-  --color-success: #22c55e;
-  --color-success-rgb: 34 197 94;
+  --color-success: #34d399;
+  --color-success-rgb: 52 211 153;
   
   /* Scrollbar */
-  --scrollbar-track: #1e1e1e;
-  --scrollbar-thumb: #3d3d3d;
-  --scrollbar-thumb-hover: #4d4d4d;
+  --scrollbar-track: var(--paperboy-bg);
+  --scrollbar-thumb: var(--paperboy-border);
+  --scrollbar-thumb-hover: var(--paperboy-border-strong);
 
   /* UI Effects */
   --backdrop-blur: 0px;
@@ -140,25 +151,36 @@
 [data-font="literata"] { --font-sans: 'Literata', Georgia, 'Times New Roman', serif; }
 
 [data-theme="liquid-glass"] {
-  /* Liquid Glass Theme */
-  --color-bg-main: #eef2f6;
-  --color-bg-panel: rgba(255, 255, 255, 0.95);
-  --color-bg-card: rgba(255, 255, 255, 0.95);
-  --color-bg-elevated: #ffffff;
-  --color-bg-hover: rgba(255, 255, 255, 0.98);
+  /* Paperboy-aligned light theme */
+  --paperboy-bg: #f8fafc;
+  --paperboy-surface: #ffffff;
+  --paperboy-surface-raised: #ffffff;
+  --paperboy-surface-muted: #f1f5f9;
+  --paperboy-border: #dbe3ee;
+  --paperboy-border-strong: #cbd5e1;
+  --paperboy-purple: #5e0ed7;
+  --paperboy-purple-bright: #7c3aed;
+  --paperboy-text: #0f172a;
+  --paperboy-muted: #64748b;
+
+  --color-bg-main: var(--paperboy-bg);
+  --color-bg-panel: var(--paperboy-surface);
+  --color-bg-card: var(--paperboy-surface-muted);
+  --color-bg-elevated: var(--paperboy-surface-raised);
+  --color-bg-hover: #e9eef6;
   
-  --color-text-primary: #1e293b;
-  --color-text-secondary: #64748b;
+  --color-text-primary: var(--paperboy-text);
+  --color-text-secondary: var(--paperboy-muted);
   --color-text-tertiary: #94a3b8;
   
-  --color-border: rgba(203, 213, 225, 0.6);
-  --color-border-hover: rgba(148, 163, 184, 0.6);
+  --color-border: var(--paperboy-border);
+  --color-border-hover: var(--paperboy-border-strong);
   
-  --color-accent: #0ea5e9; /* Sky-500 */
-  --color-accent-rgb: 14 165 233;
-  --color-accent-hover: #0284c7; /* Sky-600 */
-  --color-accent-light: #38bdf8; /* Sky-400 */
-  --color-accent-alpha: rgba(14, 165, 233, 0.15);
+  --color-accent: var(--paperboy-purple);
+  --color-accent-rgb: 94 14 215;
+  --color-accent-hover: var(--paperboy-purple-bright);
+  --color-accent-light: #8b5cf6;
+  --color-accent-alpha: rgba(94, 14, 215, 0.14);
   
   --color-success: #22c55e;
   --color-success-rgb: 34 197 94;
@@ -169,7 +191,7 @@
   --scrollbar-thumb-hover: rgba(148, 163, 184, 0.8);
   
   /* UI Effects */
-  --backdrop-blur: 12px;
+  --backdrop-blur: 0px;
 }
 
 /* Scrollbar styling */
@@ -250,7 +272,7 @@ body {
   font-family: var(--font-sans);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  letter-spacing: -0.011em;
+  letter-spacing: 0;
   transition: background-color 0.3s ease, color 0.3s ease;
 }
 
