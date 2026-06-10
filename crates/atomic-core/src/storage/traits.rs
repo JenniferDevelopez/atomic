@@ -1157,6 +1157,35 @@ pub trait TaskRunStore: Send + Sync {
         subject_id: Option<&str>,
         limit: i32,
     ) -> StorageResult<Vec<crate::models::TaskRun>>;
+
+    /// Delete one batch of terminal rows eligible under the retention
+    /// policy (see `scheduler::gc`). Returns the number of rows deleted;
+    /// the caller loops until a batch comes back short of `batch_size`.
+    ///
+    /// Eligibility, evaluated entirely in SQL so both backends share one
+    /// contract:
+    ///
+    /// - Only terminal rows (`succeeded` / `failed` / `abandoned`) are
+    ///   candidates — `pending` and `running` rows are live execution
+    ///   state and are never touched.
+    /// - A terminal row is eligible when it falls outside the most-recent
+    ///   `keep_per_subject` terminal rows of its `(task_id, subject_id)`
+    ///   group, OR its `created_at` is older than `age_cutoff` (the hard
+    ///   age cap applies even inside the keep window).
+    /// - Exception: the most recent terminal *failure* per group is
+    ///   retained regardless of the above while its `created_at` is at or
+    ///   after `failed_cutoff` — "why did this stop working?" must stay
+    ///   answerable longer than success noise.
+    ///
+    /// Deletes oldest-first so a bounded batch always makes progress on
+    /// the least valuable history.
+    async fn gc_task_runs(
+        &self,
+        keep_per_subject: i32,
+        age_cutoff: &str,
+        failed_cutoff: &str,
+        batch_size: i32,
+    ) -> StorageResult<u64>;
 }
 
 // ==================== Reports ====================

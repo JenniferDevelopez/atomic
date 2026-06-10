@@ -486,4 +486,65 @@ impl TaskRunStore for PostgresStorage {
             .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
         rows.iter().map(row_to_task_run).collect()
     }
+
+    /// One bounded retention-GC batch — the same SQL shape as the SQLite
+    /// impl (see `TaskRunStore::gc_task_runs` for the eligibility
+    /// contract) with every table scan fenced on `db_id` so one logical
+    /// database's GC can't rank or delete a sibling's history.
+    async fn gc_task_runs(
+        &self,
+        keep_per_subject: i32,
+        age_cutoff: &str,
+        failed_cutoff: &str,
+        batch_size: i32,
+    ) -> StorageResult<u64> {
+        let result = with_retry(|| async {
+            sqlx::query(
+                "WITH terminal AS (
+                     SELECT id, created_at,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY task_id, subject_id
+                                ORDER BY created_at DESC, id DESC
+                            ) AS recency_rank
+                       FROM task_runs
+                      WHERE db_id = $1
+                        AND state IN ('succeeded', 'failed', 'abandoned')
+                 ),
+                 protected_failure AS (
+                     SELECT id
+                       FROM (
+                           SELECT id, created_at,
+                                  ROW_NUMBER() OVER (
+                                      PARTITION BY task_id, subject_id
+                                      ORDER BY created_at DESC, id DESC
+                                  ) AS failure_rank
+                             FROM task_runs
+                            WHERE db_id = $1
+                              AND state IN ('failed', 'abandoned')
+                       ) f
+                      WHERE failure_rank = 1 AND created_at >= $4
+                 )
+                 DELETE FROM task_runs
+                  WHERE db_id = $1
+                    AND id IN (
+                        SELECT t.id
+                          FROM terminal t
+                         WHERE (t.recency_rank > $2 OR t.created_at < $3)
+                           AND t.id NOT IN (SELECT id FROM protected_failure)
+                         ORDER BY t.created_at ASC, t.id ASC
+                         LIMIT $5
+                    )",
+            )
+            .bind(&self.db_id)
+            .bind(keep_per_subject as i64)
+            .bind(age_cutoff)
+            .bind(failed_cutoff)
+            .bind(batch_size as i64)
+            .execute(&self.pool)
+            .await
+        })
+        .await
+        .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        Ok(result.rows_affected())
+    }
 }

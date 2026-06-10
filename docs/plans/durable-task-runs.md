@@ -45,7 +45,17 @@ them, resolving the tag's *current* name and settling rows whose tag was
 deleted in the meantime. There is no fast-path cache — the article row is
 the artifact and the hot `get_wiki` path never touches `task_runs`.
 
-Outstanding: phase 5 below (retention GC).
+Phase 5 is **landed**: `task_runs_gc` is a `ScheduledTask` registered
+alongside the others (hourly default), dispatched through the ledger it
+collects — its own run history is bounded by the same policy, and its
+in-flight row is `running` (non-terminal) so it can never delete the row
+recording it. The eligibility policy lives in one SQL statement per
+backend (`TaskRunStore::gc_task_runs`, contract-tested against both);
+`scheduler::gc` owns the `task.task_runs_gc.*` knobs (read at run time
+via `core.storage()` with the defaults below — no seed rows) and the
+batched-delete loop (500 rows per batch, yielding between batches).
+
+All phases are landed; this workstream is complete.
 Note `daily_briefing` no longer exists as a scheduled task — it collapsed
 into a seeded report (see `reports-phase-3-briefing-collapse.md`).
 
@@ -214,7 +224,8 @@ Each phase is independently shippable and testable.
    Subject-keying gives natural per-tag dedup via the live-lease check;
    retry/backoff (driven by a sweep on the scheduler tick) replaces
    silent loss on LLM failure.
-5. **Retention GC.** `task_runs_gc` scheduled task with the policy + batched deletes above.
+5. **Retention GC.** ✅ Landed (as `scheduler::gc`; see Status).
+   `task_runs_gc` scheduled task with the policy + batched deletes above.
 6. *(Follow-up, out of scope here)* Automations/recipes reuse the same ledger via `task_id = <automation id>` — no schema change expected.
 
 ## Risks & mitigations

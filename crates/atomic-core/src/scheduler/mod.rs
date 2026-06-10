@@ -10,6 +10,7 @@
 //! the `last_run` fast-path advance, and event emission. See
 //! [`runner::run_task`] for the claim-and-record contract.
 
+pub mod gc;
 pub mod ledger;
 pub mod runner;
 pub mod state;

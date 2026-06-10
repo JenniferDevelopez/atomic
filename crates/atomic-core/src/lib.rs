@@ -7169,6 +7169,204 @@ mod tests {
         assert!(!task.is_due(&db).await, "processed dirt clears due-ness");
     }
 
+    // ==================== task_runs retention GC (phase 5) ====================
+    //
+    // The per-rule eligibility SQL is contract-tested against both backends
+    // in tests/storage_tests.rs; these tests pin the task layer: policy
+    // knobs resolve from per-DB settings with the plan's defaults, the
+    // sweep loop drains a backlog in bounded batches, and the task itself
+    // dispatches through the same ledger it collects (dogfooding).
+
+    use crate::scheduler::gc::{self as task_gc, GcOutcome, RetentionPolicy, TaskRunsGcTask};
+
+    /// Seed a terminal ledger row dated `created_at` — GC test fixture.
+    async fn seed_terminal_run(
+        db: &AtomicCore,
+        task_id: &str,
+        state: TaskRunState,
+        created_at: chrono::DateTime<Utc>,
+    ) {
+        let ts = created_at.to_rfc3339();
+        let row = TaskRun {
+            id: uuid::Uuid::now_v7().to_string(),
+            task_id: task_id.to_string(),
+            subject_id: None,
+            state,
+            trigger: TaskRunTrigger::Schedule,
+            attempts: 1,
+            max_attempts: 3,
+            lease_until: None,
+            next_attempt_at: ts.clone(),
+            scope: None,
+            result_id: None,
+            last_error: None,
+            started_at: None,
+            finished_at: Some(ts.clone()),
+            created_at: ts.clone(),
+            updated_at: ts,
+        };
+        db.storage.insert_task_run_sync(&row).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn gc_policy_loads_defaults_and_overrides() {
+        // Fresh DB: empty per-DB settings table (the load-bearing
+        // invariant — no migration seeds these keys) yields the plan's
+        // defaults.
+        let (db, _temp) = create_test_db().await;
+        assert_eq!(RetentionPolicy::load(&db).await, RetentionPolicy::default());
+
+        // Valid overrides are honored. Written via storage directly —
+        // the same per-DB path the loader reads.
+        for (key, value) in [
+            ("task.task_runs_gc.keep_per_subject", "5"),
+            ("task.task_runs_gc.retain_days", "7"),
+            ("task.task_runs_gc.retain_failed_days", "14"),
+        ] {
+            db.storage.set_setting_sync(key, value).await.unwrap();
+        }
+        assert_eq!(
+            RetentionPolicy::load(&db).await,
+            RetentionPolicy {
+                keep_per_subject: 5,
+                retain_days: 7,
+                retain_failed_days: 14,
+            }
+        );
+
+        // Garbage falls back per-knob: zero, negative, and unparseable
+        // values must not become "delete everything immediately".
+        for (key, value) in [
+            ("task.task_runs_gc.keep_per_subject", "0"),
+            ("task.task_runs_gc.retain_days", "-3"),
+            ("task.task_runs_gc.retain_failed_days", "ninety"),
+        ] {
+            db.storage.set_setting_sync(key, value).await.unwrap();
+        }
+        assert_eq!(RetentionPolicy::load(&db).await, RetentionPolicy::default());
+    }
+
+    #[tokio::test]
+    async fn gc_sweep_drains_backlog_in_bounded_batches() {
+        // 7 collectible rows with batch size 3 → exactly 3 storage
+        // round-trips (3 + 3 + 1), everything gone. The short final batch
+        // doubles as the loop's termination signal.
+        let (db, _temp) = create_test_db().await;
+        let now = Utc::now();
+        for i in 0..7 {
+            seed_terminal_run(
+                &db,
+                "stub_gc_batch",
+                TaskRunState::Succeeded,
+                now - chrono::Duration::days(40) - chrono::Duration::minutes(i),
+            )
+            .await;
+        }
+
+        let outcome = task_gc::sweep(&db, &RetentionPolicy::default(), 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            GcOutcome {
+                deleted: 7,
+                batches: 3
+            }
+        );
+        assert!(db
+            .list_task_runs("stub_gc_batch", None, 10)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn gc_task_dispatches_through_ledger_and_prunes_history() {
+        let (db, _temp) = create_test_db().await;
+        let ctx = noop_ctx();
+        let task = TaskRunsGcTask;
+
+        // A keep-window override the run must pick up, plus a 5-row
+        // history (recent, so only the K rule can prune it).
+        db.storage
+            .set_setting_sync("task.task_runs_gc.keep_per_subject", "2")
+            .await
+            .unwrap();
+        let now = Utc::now();
+        for i in 1..=5 {
+            seed_terminal_run(
+                &db,
+                "stub_gc_history",
+                TaskRunState::Succeeded,
+                now - chrono::Duration::minutes(i),
+            )
+            .await;
+        }
+
+        let outcome = runner::run_task(&db, "test-db", &task, &ctx).await.unwrap();
+        assert!(matches!(outcome, DispatchOutcome::Succeeded));
+
+        let history = db
+            .list_task_runs("stub_gc_history", None, 10)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 2, "pruned to the overridden keep window");
+
+        // Dogfooding: the sweep itself settled a succeeded ledger row and
+        // advanced the last_run fast-path...
+        let own = db.list_task_runs(task_gc::TASK_ID, None, 10).await.unwrap();
+        assert_eq!(own.len(), 1);
+        assert_eq!(own[0].state, TaskRunState::Succeeded);
+        assert!(sched_state::get_last_run(&db, task_gc::TASK_ID)
+            .await
+            .unwrap()
+            .is_some());
+
+        // ...so the hourly default interval gates the next tick.
+        let outcome = runner::run_task(&db, "test-db", &task, &ctx).await.unwrap();
+        assert!(matches!(outcome, DispatchOutcome::NotDue));
+
+        // An interval_minutes override re-opens the gate once last_run
+        // falls outside the shorter window.
+        db.storage
+            .set_setting_sync("task.task_runs_gc.interval_minutes", "1")
+            .await
+            .unwrap();
+        sched_state::set_last_run(
+            &db,
+            task_gc::TASK_ID,
+            Utc::now() - chrono::Duration::minutes(2),
+        )
+        .await
+        .unwrap();
+        let outcome = runner::run_task(&db, "test-db", &task, &ctx).await.unwrap();
+        assert!(matches!(outcome, DispatchOutcome::Succeeded));
+        let own = db.list_task_runs(task_gc::TASK_ID, None, 10).await.unwrap();
+        assert_eq!(own.len(), 2, "second sweep recorded its own run");
+    }
+
+    #[tokio::test]
+    async fn gc_disabled_via_setting_is_not_due() {
+        let (db, _temp) = create_test_db().await;
+        db.storage
+            .set_setting_sync("task.task_runs_gc.enabled", "false")
+            .await
+            .unwrap();
+
+        let ctx = noop_ctx();
+        let outcome = runner::run_task(&db, "test-db", &TaskRunsGcTask, &ctx)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, DispatchOutcome::NotDue));
+        assert!(
+            db.list_task_runs(task_gc::TASK_ID, None, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a disabled GC never touches the ledger"
+        );
+    }
+
     // ==================== Feed polling via the ledger (phase 3) ====================
     //
     // Feed polls ride the same `task_runs` ledger as system tasks, keyed

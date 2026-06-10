@@ -436,6 +436,62 @@ impl SqliteStorage {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
+
+    /// One bounded retention-GC batch. See `TaskRunStore::gc_task_runs`
+    /// for the eligibility contract; the window functions rank terminal
+    /// rows newest-first per `(task_id, subject_id)` group (NULL subjects
+    /// partition together, matching the singleton-task grain), and the
+    /// `protected_failure` CTE carves out the most recent failure per
+    /// group while it's younger than `failed_cutoff`. The `id` tiebreakers
+    /// make ranking deterministic when timestamps collide.
+    pub(crate) fn gc_task_runs_sync(
+        &self,
+        keep_per_subject: i32,
+        age_cutoff: &str,
+        failed_cutoff: &str,
+        batch_size: i32,
+    ) -> StorageResult<u64> {
+        let conn = self
+            .db
+            .conn
+            .lock()
+            .map_err(|e| AtomicCoreError::Lock(e.to_string()))?;
+        let deleted = conn.execute(
+            "WITH terminal AS (
+                 SELECT id, created_at,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY task_id, subject_id
+                            ORDER BY created_at DESC, id DESC
+                        ) AS recency_rank
+                   FROM task_runs
+                  WHERE state IN ('succeeded', 'failed', 'abandoned')
+             ),
+             protected_failure AS (
+                 SELECT id
+                   FROM (
+                       SELECT id, created_at,
+                              ROW_NUMBER() OVER (
+                                  PARTITION BY task_id, subject_id
+                                  ORDER BY created_at DESC, id DESC
+                              ) AS failure_rank
+                         FROM task_runs
+                        WHERE state IN ('failed', 'abandoned')
+                   ) f
+                  WHERE failure_rank = 1 AND created_at >= ?3
+             )
+             DELETE FROM task_runs
+              WHERE id IN (
+                  SELECT t.id
+                    FROM terminal t
+                   WHERE (t.recency_rank > ?1 OR t.created_at < ?2)
+                     AND t.id NOT IN (SELECT id FROM protected_failure)
+                   ORDER BY t.created_at ASC, t.id ASC
+                   LIMIT ?4
+              )",
+            params![keep_per_subject, age_cutoff, failed_cutoff, batch_size],
+        )?;
+        Ok(deleted as u64)
+    }
 }
 
 #[async_trait]
@@ -636,6 +692,23 @@ impl TaskRunStore for SqliteStorage {
         let subject_id = subject_id.map(|s| s.to_string());
         tokio::task::spawn_blocking(move || {
             storage.list_recent_task_runs_sync(&task_id, subject_id.as_deref(), limit)
+        })
+        .await
+        .map_err(|e| AtomicCoreError::Lock(e.to_string()))?
+    }
+
+    async fn gc_task_runs(
+        &self,
+        keep_per_subject: i32,
+        age_cutoff: &str,
+        failed_cutoff: &str,
+        batch_size: i32,
+    ) -> StorageResult<u64> {
+        let storage = self.clone();
+        let age_cutoff = age_cutoff.to_string();
+        let failed_cutoff = failed_cutoff.to_string();
+        tokio::task::spawn_blocking(move || {
+            storage.gc_task_runs_sync(keep_per_subject, &age_cutoff, &failed_cutoff, batch_size)
         })
         .await
         .map_err(|e| AtomicCoreError::Lock(e.to_string()))?

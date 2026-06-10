@@ -569,6 +569,249 @@ async fn test_list_runnable_task_runs(storage: &dyn TaskRunStore) {
     assert!(other.iter().all(|r| r.task_id != task_id));
 }
 
+// ==================== task_runs retention GC ====================
+//
+// `gc_task_runs` is one bounded delete batch; the policy lives entirely in
+// its SQL, so each rule is pinned here against both backends. Each test
+// uses a unique task id so reruns against the shared Postgres database
+// can't see a previous run's rows.
+
+/// Build a row with caller-controlled state and `created_at` — the GC
+/// ranks (per-subject recency) and ages entirely on `created_at`.
+fn gc_run_row(
+    task_id: &str,
+    subject_id: Option<&str>,
+    state: TaskRunState,
+    created_at: &str,
+) -> TaskRun {
+    TaskRun {
+        id: uuid::Uuid::new_v4().to_string(),
+        task_id: task_id.to_string(),
+        subject_id: subject_id.map(String::from),
+        state,
+        trigger: TaskRunTrigger::Schedule,
+        attempts: 1,
+        max_attempts: 3,
+        lease_until: None,
+        next_attempt_at: created_at.to_string(),
+        scope: None,
+        result_id: None,
+        last_error: None,
+        started_at: None,
+        finished_at: state.is_terminal().then(|| created_at.to_string()),
+        created_at: created_at.to_string(),
+        updated_at: created_at.to_string(),
+    }
+}
+
+/// Surviving row ids for a task, any subject, newest-first.
+async fn surviving_gc_ids(storage: &dyn TaskRunStore, task_id: &str) -> Vec<String> {
+    storage
+        .list_recent_task_runs(task_id, None, 1000)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect()
+}
+
+/// Rule: non-terminal rows are live execution state — never deleted, no
+/// matter how old. `keep = 0` with both cutoffs at `now` makes every
+/// terminal row eligible, so the state predicate is the only protection.
+async fn test_gc_task_runs_never_deletes_non_terminal(storage: &dyn TaskRunStore) {
+    let task_id = format!("gc_live::{}", uuid::Uuid::new_v4());
+    let now = chrono::Utc::now();
+    let ancient = (now - chrono::Duration::days(400)).to_rfc3339();
+
+    let pending = gc_run_row(
+        &task_id,
+        Some("backing-off"),
+        TaskRunState::Pending,
+        &ancient,
+    );
+    // Crashed run: still `running` with a long-expired lease. Reclaimable,
+    // not collectible.
+    let mut crashed = gc_run_row(&task_id, Some("crashed"), TaskRunState::Running, &ancient);
+    crashed.lease_until = Some(ancient.clone());
+    let settled = gc_run_row(&task_id, Some("settled"), TaskRunState::Succeeded, &ancient);
+    for row in [&pending, &crashed, &settled] {
+        storage.insert_task_run(row).await.unwrap();
+    }
+
+    let now_str = now.to_rfc3339();
+    let deleted = storage
+        .gc_task_runs(0, &now_str, &now_str, 100)
+        .await
+        .unwrap();
+
+    assert_eq!(deleted, 1, "only the terminal row is collectible");
+    assert!(storage.get_task_run(&pending.id).await.unwrap().is_some());
+    assert!(storage.get_task_run(&crashed.id).await.unwrap().is_some());
+    assert!(storage.get_task_run(&settled.id).await.unwrap().is_none());
+}
+
+/// Rule: per `(task_id, subject_id)`, the most recent K terminal rows
+/// survive — each subject keeps its own window, and the NULL subject
+/// (singleton system tasks) is its own group.
+async fn test_gc_task_runs_keeps_most_recent_k_per_subject(storage: &dyn TaskRunStore) {
+    let task_id = format!("gc_window::{}", uuid::Uuid::new_v4());
+    let now = chrono::Utc::now();
+    let at = |mins: i64| (now - chrono::Duration::minutes(mins)).to_rfc3339();
+
+    // Subject "feed-a": 4 recent successes; NULL subject: 3.
+    let feed_rows: Vec<TaskRun> = (1..=4)
+        .map(|m| gc_run_row(&task_id, Some("feed-a"), TaskRunState::Succeeded, &at(m)))
+        .collect();
+    let singleton_rows: Vec<TaskRun> = (1..=3)
+        .map(|m| gc_run_row(&task_id, None, TaskRunState::Succeeded, &at(m)))
+        .collect();
+    for row in feed_rows.iter().chain(&singleton_rows) {
+        storage.insert_task_run(row).await.unwrap();
+    }
+
+    let age_cutoff = (now - chrono::Duration::days(30)).to_rfc3339();
+    let failed_cutoff = (now - chrono::Duration::days(90)).to_rfc3339();
+    let deleted = storage
+        .gc_task_runs(2, &age_cutoff, &failed_cutoff, 100)
+        .await
+        .unwrap();
+
+    assert_eq!(deleted, 3, "2 trimmed from feed-a, 1 from the NULL group");
+    let survivors = surviving_gc_ids(storage, &task_id).await;
+    let expected: Vec<&str> = feed_rows[..2]
+        .iter()
+        .chain(&singleton_rows[..2])
+        .map(|r| r.id.as_str())
+        .collect();
+    assert_eq!(survivors.len(), 4);
+    assert!(
+        expected.iter().all(|id| survivors.iter().any(|s| s == id)),
+        "each group keeps exactly its 2 newest rows"
+    );
+}
+
+/// Rule: the hard age cap deletes terminal rows older than `retain_days`
+/// even when they sit comfortably inside the keep-K window.
+async fn test_gc_task_runs_age_cap_applies_inside_keep_window(storage: &dyn TaskRunStore) {
+    let task_id = format!("gc_age::{}", uuid::Uuid::new_v4());
+    let now = chrono::Utc::now();
+
+    let recent = gc_run_row(
+        &task_id,
+        Some("subject"),
+        TaskRunState::Succeeded,
+        &(now - chrono::Duration::minutes(1)).to_rfc3339(),
+    );
+    let expired = gc_run_row(
+        &task_id,
+        Some("subject"),
+        TaskRunState::Succeeded,
+        &(now - chrono::Duration::days(31)).to_rfc3339(),
+    );
+    for row in [&recent, &expired] {
+        storage.insert_task_run(row).await.unwrap();
+    }
+
+    // keep = 50: both rows are within the recency window — only the age
+    // cap can make the old one eligible.
+    let age_cutoff = (now - chrono::Duration::days(30)).to_rfc3339();
+    let failed_cutoff = (now - chrono::Duration::days(90)).to_rfc3339();
+    let deleted = storage
+        .gc_task_runs(50, &age_cutoff, &failed_cutoff, 100)
+        .await
+        .unwrap();
+
+    assert_eq!(deleted, 1);
+    assert!(storage.get_task_run(&recent.id).await.unwrap().is_some());
+    assert!(storage.get_task_run(&expired.id).await.unwrap().is_none());
+}
+
+/// Rule: the most recent terminal failure per group outlives both the
+/// keep-K window and the age cap, until it ages past `retain_failed_days`.
+/// Older failures and successes in the same group get no such grace.
+async fn test_gc_task_runs_retains_most_recent_failure(storage: &dyn TaskRunStore) {
+    let task_id = format!("gc_failure::{}", uuid::Uuid::new_v4());
+    let now = chrono::Utc::now();
+    let days_ago = |d: i64| (now - chrono::Duration::days(d)).to_rfc3339();
+
+    // feed-x: the most recent failure (40d) is past retain_days but inside
+    // retain_failed_days — protected. Its older failure (50d) and an old
+    // success (45d) are not.
+    let protected = gc_run_row(
+        &task_id,
+        Some("feed-x"),
+        TaskRunState::Abandoned,
+        &days_ago(40),
+    );
+    let older_failure = gc_run_row(
+        &task_id,
+        Some("feed-x"),
+        TaskRunState::Failed,
+        &days_ago(50),
+    );
+    let old_success = gc_run_row(
+        &task_id,
+        Some("feed-x"),
+        TaskRunState::Succeeded,
+        &days_ago(45),
+    );
+    // feed-y: its most recent failure is older than retain_failed_days —
+    // the exception lapses and it goes too.
+    let lapsed_failure = gc_run_row(
+        &task_id,
+        Some("feed-y"),
+        TaskRunState::Failed,
+        &days_ago(120),
+    );
+    for row in [&protected, &older_failure, &old_success, &lapsed_failure] {
+        storage.insert_task_run(row).await.unwrap();
+    }
+
+    // keep = 0 so every row is rank-eligible: the failure exception is the
+    // only thing that can keep a row alive here.
+    let age_cutoff = days_ago(30);
+    let failed_cutoff = days_ago(90);
+    let deleted = storage
+        .gc_task_runs(0, &age_cutoff, &failed_cutoff, 100)
+        .await
+        .unwrap();
+
+    assert_eq!(deleted, 3);
+    let survivors = surviving_gc_ids(storage, &task_id).await;
+    assert_eq!(survivors, vec![protected.id.clone()]);
+}
+
+/// Each call deletes at most `batch_size` rows (oldest first) and reports
+/// the count, so the caller's loop can drain a backlog without one giant
+/// delete holding the write lock.
+async fn test_gc_task_runs_batches_are_bounded(storage: &dyn TaskRunStore) {
+    let task_id = format!("gc_batch::{}", uuid::Uuid::new_v4());
+    let now = chrono::Utc::now();
+    for i in 0..7 {
+        let created =
+            (now - chrono::Duration::days(40) - chrono::Duration::minutes(i)).to_rfc3339();
+        let row = gc_run_row(&task_id, Some("subject"), TaskRunState::Succeeded, &created);
+        storage.insert_task_run(&row).await.unwrap();
+    }
+
+    let age_cutoff = (now - chrono::Duration::days(30)).to_rfc3339();
+    let failed_cutoff = (now - chrono::Duration::days(90)).to_rfc3339();
+    let mut per_call = Vec::new();
+    loop {
+        let deleted = storage
+            .gc_task_runs(0, &age_cutoff, &failed_cutoff, 3)
+            .await
+            .unwrap();
+        per_call.push(deleted);
+        if deleted < 3 {
+            break;
+        }
+    }
+
+    assert_eq!(per_call, vec![3, 3, 1], "bounded batches until drained");
+    assert!(surviving_gc_ids(storage, &task_id).await.is_empty());
+}
+
 // ==================== ChatStore Tests ====================
 
 async fn test_create_conversation(storage: &dyn ChatStore) {
@@ -783,6 +1026,36 @@ async fn sqlite_list_runnable_task_runs() {
 }
 
 #[tokio::test]
+async fn sqlite_gc_task_runs_never_deletes_non_terminal() {
+    let (s, _dir) = sqlite_storage().await;
+    test_gc_task_runs_never_deletes_non_terminal(&s).await;
+}
+
+#[tokio::test]
+async fn sqlite_gc_task_runs_keeps_most_recent_k_per_subject() {
+    let (s, _dir) = sqlite_storage().await;
+    test_gc_task_runs_keeps_most_recent_k_per_subject(&s).await;
+}
+
+#[tokio::test]
+async fn sqlite_gc_task_runs_age_cap_applies_inside_keep_window() {
+    let (s, _dir) = sqlite_storage().await;
+    test_gc_task_runs_age_cap_applies_inside_keep_window(&s).await;
+}
+
+#[tokio::test]
+async fn sqlite_gc_task_runs_retains_most_recent_failure() {
+    let (s, _dir) = sqlite_storage().await;
+    test_gc_task_runs_retains_most_recent_failure(&s).await;
+}
+
+#[tokio::test]
+async fn sqlite_gc_task_runs_batches_are_bounded() {
+    let (s, _dir) = sqlite_storage().await;
+    test_gc_task_runs_batches_are_bounded(&s).await;
+}
+
+#[tokio::test]
 async fn sqlite_create_conversation() {
     let (s, _dir) = sqlite_storage().await;
     test_create_conversation(&s).await;
@@ -869,6 +1142,26 @@ mod postgres_tests {
     pg_test!(pg_delete_tag, test_delete_tag);
     pg_test!(pg_get_tag, test_get_tag);
     pg_test!(pg_list_runnable_task_runs, test_list_runnable_task_runs);
+    pg_test!(
+        pg_gc_task_runs_never_deletes_non_terminal,
+        test_gc_task_runs_never_deletes_non_terminal
+    );
+    pg_test!(
+        pg_gc_task_runs_keeps_most_recent_k_per_subject,
+        test_gc_task_runs_keeps_most_recent_k_per_subject
+    );
+    pg_test!(
+        pg_gc_task_runs_age_cap_applies_inside_keep_window,
+        test_gc_task_runs_age_cap_applies_inside_keep_window
+    );
+    pg_test!(
+        pg_gc_task_runs_retains_most_recent_failure,
+        test_gc_task_runs_retains_most_recent_failure
+    );
+    pg_test!(
+        pg_gc_task_runs_batches_are_bounded,
+        test_gc_task_runs_batches_are_bounded
+    );
     pg_test!(pg_create_conversation, test_create_conversation);
     pg_test!(pg_save_and_get_messages, test_save_and_get_messages);
     pg_test!(pg_delete_conversation, test_delete_conversation);

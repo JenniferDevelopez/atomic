@@ -673,6 +673,8 @@ dispatch! {
         => sqlite: fail_task_run_abandon_sync, pg_trait: TaskRunStore, pg_method: fail_task_run_abandon;
     fn list_recent_task_runs_sync(&self, task_id: &str, subject_id: Option<&str>, limit: i32) -> Result<Vec<crate::models::TaskRun>, AtomicCoreError>
         => sqlite: list_recent_task_runs_sync, pg_trait: TaskRunStore, pg_method: list_recent_task_runs;
+    fn gc_task_runs_sync(&self, keep_per_subject: i32, age_cutoff: &str, failed_cutoff: &str, batch_size: i32) -> Result<u64, AtomicCoreError>
+        => sqlite: gc_task_runs_sync, pg_trait: TaskRunStore, pg_method: gc_task_runs;
 
     // ---- ReportStore ----
     fn list_reports_sync(&self) -> Result<Vec<crate::models::Report>, AtomicCoreError>

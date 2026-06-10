@@ -520,6 +520,9 @@ async fn run_server(
             registry.register(Arc::new(
                 atomic_core::graph_maintenance::GraphMaintenanceTask,
             ));
+            // Retention GC for the ledger itself (hourly): dogfoods the same
+            // dispatch path, so GC runs get their own bounded run history.
+            registry.register(Arc::new(atomic_core::scheduler::gc::TaskRunsGcTask));
             let registry = Arc::new(registry);
             let ctx = atomic_core::scheduler::TaskContext {
                 event_cb: event_bridge::task_event_callback(task_tx.clone()),
