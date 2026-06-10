@@ -407,6 +407,8 @@ dispatch! {
         => sqlite: get_all_tags_filtered_impl, pg_trait: TagStore, pg_method: get_all_tags_filtered;
     fn get_tag_children_impl(&self, parent_id: &str, min_count: i32, limit: i32, offset: i32) -> Result<PaginatedTagChildren, AtomicCoreError>
         => sqlite: get_tag_children_impl, pg_trait: TagStore, pg_method: get_tag_children;
+    fn get_tag_sync(&self, id: &str) -> Result<Option<Tag>, AtomicCoreError>
+        => sqlite: get_tag_impl, pg_trait: TagStore, pg_method: get_tag;
     fn create_tag_impl(&self, name: &str, parent_id: Option<&str>) -> Result<Tag, AtomicCoreError>
         => sqlite: create_tag_impl, pg_trait: TagStore, pg_method: create_tag;
     fn update_tag_impl(&self, id: &str, name: &str, parent_id: Option<&str>) -> Result<Tag, AtomicCoreError>
@@ -653,6 +655,8 @@ dispatch! {
         => sqlite: get_task_run_sync, pg_trait: TaskRunStore, pg_method: get_task_run;
     fn find_runnable_task_run_sync(&self, task_id: &str, subject_id: Option<&str>, now: &str) -> Result<Option<crate::models::TaskRun>, AtomicCoreError>
         => sqlite: find_runnable_task_run_sync, pg_trait: TaskRunStore, pg_method: find_runnable_task_run;
+    fn list_runnable_task_runs_sync(&self, task_id: &str, now: &str) -> Result<Vec<crate::models::TaskRun>, AtomicCoreError>
+        => sqlite: list_runnable_task_runs_sync, pg_trait: TaskRunStore, pg_method: list_runnable_task_runs;
     fn find_active_task_run_sync(&self, task_id: &str, subject_id: Option<&str>) -> Result<Option<crate::models::TaskRun>, AtomicCoreError>
         => sqlite: find_active_task_run_sync, pg_trait: TaskRunStore, pg_method: find_active_task_run;
     fn claim_pending_task_run_sync(&self, id: &str, now: &str, lease_until: &str) -> Result<bool, AtomicCoreError>

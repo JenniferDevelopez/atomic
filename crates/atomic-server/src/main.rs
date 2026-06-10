@@ -538,6 +538,33 @@ async fn run_server(
                     &ctx,
                 )
                 .await;
+
+                // Wiki-regen retry sweep. Regeneration is event-triggered
+                // (manual request / tag change), not scheduled — nothing
+                // re-fires a failed run, so each tick also scans the ledger
+                // for runnable `wiki.regenerate` rows (failed runs whose
+                // backoff has elapsed, crashed runs with expired leases)
+                // and re-executes them. Spawned per DB so a slow LLM call
+                // can't stall the tick; overlapping sweeps dedup on the
+                // ledger's conditional claim.
+                if let Ok((dbs, _)) = task_manager.list_databases().await {
+                    for db_info in dbs {
+                        let core = match task_manager.get_core(&db_info.id).await {
+                            Ok(c) => c,
+                            Err(_) => continue,
+                        };
+                        tokio::spawn(async move {
+                            let regenerated = core.sweep_due_wiki_regens().await;
+                            if !regenerated.is_empty() {
+                                tracing::info!(
+                                    db = %db_info.name,
+                                    tags = regenerated.len(),
+                                    "[wiki.regenerate] retry sweep regenerated articles"
+                                );
+                            }
+                        });
+                    }
+                }
             }
         });
     }

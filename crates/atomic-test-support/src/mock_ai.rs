@@ -402,6 +402,18 @@ impl Respond for ChatResponder {
             // citation extractor parses `\[(\d+)\]` against that source
             // list.
             //
+            // Two marker-driven modes for the ledger e2e tests, keyed on
+            // the tag name (which lands in the prompt as `Write a wiki
+            // article about "{tag_name}"`):
+            //
+            // - `WikiFail...` → 400. Non-retryable at the provider layer
+            //   (`is_retryable` excludes 400), so the failure surfaces
+            //   immediately and the `task_runs` retry/backoff machinery —
+            //   not the provider's internal retry — owns recovery.
+            // - `WikiSlow...` → normal article after a delay, long enough
+            //   that a concurrent regeneration request deterministically
+            //   observes the first one's live lease.
+            //
             // The legacy `update_wiki` path reuses this schema for a full
             // rewrite. Detect the update prompt shape ("NEW SOURCES TO
             // INCORPORATE") and emit a *different* body that pins the new
@@ -409,6 +421,11 @@ impl Respond for ChatResponder {
             // byte-identical to the original generation and tests can't
             // distinguish the two.
             "wiki_generation_result" => {
+                if request_text.contains("wikifail") {
+                    return ResponseTemplate::new(400).set_body_json(json!({
+                        "error": { "message": "mock wiki generation failure" }
+                    }));
+                }
                 let n = count_numbered_sources(&body);
                 if let Some(new_index) = first_new_source_index(&body) {
                     // Update path: cite the new source so the test can
@@ -492,7 +509,7 @@ impl Respond for ChatResponder {
             _ => "{}".to_string(),
         };
 
-        ResponseTemplate::new(200).set_body_json(json!({
+        let mut response = ResponseTemplate::new(200).set_body_json(json!({
             "id": "mock-cmpl",
             "object": "chat.completion",
             "choices": [
@@ -505,6 +522,12 @@ impl Respond for ChatResponder {
                     "finish_reason": "stop",
                 }
             ],
-        }))
+        }));
+        // Slow-wiki mode: hold the response long enough that overlapping
+        // regeneration requests genuinely race the in-flight one's lease.
+        if schema_name == "wiki_generation_result" && request_text.contains("wikislow") {
+            response = response.set_delay(std::time::Duration::from_millis(1500));
+        }
+        response
     }
 }

@@ -45,7 +45,7 @@ async fn postgres_storage() -> Option<atomic_core::storage::PostgresStorage> {
          semantic_edges, atom_clusters, tag_embeddings, \
          wiki_articles, wiki_citations, wiki_links, wiki_article_versions, atom_links, \
          conversations, conversation_tags, chat_messages, chat_tool_calls, chat_citations, \
-         feeds, feed_tags, feed_items, settings, \
+         feeds, feed_tags, feed_items, settings, task_runs, \
          briefing_citations, briefings, oauth_codes, oauth_clients, api_tokens \
          CASCADE",
     )
@@ -459,6 +459,116 @@ async fn test_delete_tag(storage: &dyn TagStore) {
     assert!(!tags.iter().any(|t| t.tag.id == tag.id));
 }
 
+async fn test_get_tag(storage: &dyn TagStore) {
+    let tag = storage.create_tag("Lookup Tag", None).await.unwrap();
+    let fetched = storage.get_tag(&tag.id).await.unwrap();
+    assert_eq!(
+        fetched.as_ref().map(|t| t.name.as_str()),
+        Some("Lookup Tag")
+    );
+    assert_eq!(fetched.unwrap().id, tag.id);
+
+    let missing = storage.get_tag("nonexistent-tag-id").await.unwrap();
+    assert!(missing.is_none());
+}
+
+// ==================== TaskRunStore Tests ====================
+
+/// Build a `TaskRun` row with caller-controlled state/timing fields —
+/// `insert_task_run`'s contract is that the caller owns every column.
+fn task_run_row(
+    task_id: &str,
+    subject_id: &str,
+    state: TaskRunState,
+    next_attempt_at: &str,
+    lease_until: Option<&str>,
+) -> TaskRun {
+    let now = chrono::Utc::now().to_rfc3339();
+    TaskRun {
+        id: uuid::Uuid::new_v4().to_string(),
+        task_id: task_id.to_string(),
+        subject_id: Some(subject_id.to_string()),
+        state,
+        trigger: TaskRunTrigger::Schedule,
+        attempts: 1,
+        max_attempts: 3,
+        lease_until: lease_until.map(String::from),
+        next_attempt_at: next_attempt_at.to_string(),
+        scope: None,
+        result_id: None,
+        last_error: None,
+        started_at: None,
+        finished_at: None,
+        created_at: now.clone(),
+        updated_at: now,
+    }
+}
+
+/// The sweep query behind event-triggered retries (wiki regen): every
+/// pending row past its `next_attempt_at` plus every running row whose
+/// lease expired, across all subjects, earliest `next_attempt_at` first —
+/// and nothing else.
+async fn test_list_runnable_task_runs(storage: &dyn TaskRunStore) {
+    // Unique task id per invocation so reruns against a shared Postgres
+    // database can't see a previous run's rows.
+    let task_id = format!("sweep_test::{}", uuid::Uuid::new_v4());
+    let now = chrono::Utc::now();
+    let past = (now - chrono::Duration::minutes(5)).to_rfc3339();
+    let earlier_past = (now - chrono::Duration::minutes(10)).to_rfc3339();
+    let future = (now + chrono::Duration::minutes(5)).to_rfc3339();
+
+    let due = task_run_row(&task_id, "subject-due", TaskRunState::Pending, &past, None);
+    let crashed = task_run_row(
+        &task_id,
+        "subject-crashed",
+        TaskRunState::Running,
+        &earlier_past,
+        Some(&past), // lease expired — crash-recovery candidate
+    );
+    let backed_off = task_run_row(
+        &task_id,
+        "subject-backoff",
+        TaskRunState::Pending,
+        &future,
+        None,
+    );
+    let in_flight = task_run_row(
+        &task_id,
+        "subject-live",
+        TaskRunState::Running,
+        &past,
+        Some(&future), // live lease — owned by another worker
+    );
+    let settled = task_run_row(
+        &task_id,
+        "subject-done",
+        TaskRunState::Succeeded,
+        &past,
+        None,
+    );
+    for row in [&due, &crashed, &backed_off, &in_flight, &settled] {
+        storage.insert_task_run(row).await.unwrap();
+    }
+
+    let runnable = storage
+        .list_runnable_task_runs(&task_id, &now.to_rfc3339())
+        .await
+        .unwrap();
+    let ids: Vec<&str> = runnable.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec![crashed.id.as_str(), due.id.as_str()],
+        "exactly the due-pending and expired-lease rows, earliest next_attempt_at first"
+    );
+
+    // Other task ids never bleed into the sweep.
+    let other = storage
+        .list_runnable_task_runs("some_other_task", &now.to_rfc3339())
+        .await
+        .unwrap();
+    assert!(other.iter().all(|r| r.task_id != task_id));
+}
+
 // ==================== ChatStore Tests ====================
 
 async fn test_create_conversation(storage: &dyn ChatStore) {
@@ -661,6 +771,18 @@ async fn sqlite_delete_tag() {
 }
 
 #[tokio::test]
+async fn sqlite_get_tag() {
+    let (s, _dir) = sqlite_storage().await;
+    test_get_tag(&s).await;
+}
+
+#[tokio::test]
+async fn sqlite_list_runnable_task_runs() {
+    let (s, _dir) = sqlite_storage().await;
+    test_list_runnable_task_runs(&s).await;
+}
+
+#[tokio::test]
 async fn sqlite_create_conversation() {
     let (s, _dir) = sqlite_storage().await;
     test_create_conversation(&s).await;
@@ -745,6 +867,8 @@ mod postgres_tests {
     pg_test!(pg_create_and_get_tags, test_create_and_get_tags);
     pg_test!(pg_update_tag, test_update_tag);
     pg_test!(pg_delete_tag, test_delete_tag);
+    pg_test!(pg_get_tag, test_get_tag);
+    pg_test!(pg_list_runnable_task_runs, test_list_runnable_task_runs);
     pg_test!(pg_create_conversation, test_create_conversation);
     pg_test!(pg_save_and_get_messages, test_save_and_get_messages);
     pg_test!(pg_delete_conversation, test_delete_conversation);

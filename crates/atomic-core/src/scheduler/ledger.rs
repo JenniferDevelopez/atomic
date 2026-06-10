@@ -180,6 +180,33 @@ pub async fn claim_or_create(
     )))
 }
 
+/// Attempt to claim a specific known row — typically one discovered by a
+/// sweep over [`crate::storage::traits::TaskRunStore::list_runnable_task_runs`]
+/// — without the find-or-insert step of [`claim_or_create`].
+///
+/// Never inserts: `Ok(None)` means the row settled or was claimed by a peer
+/// between the caller's scan and this claim, and the caller should move on
+/// rather than fall back to creating fresh work — that's `claim_or_create`'s
+/// job for new firings. The conditional UPDATEs in storage enforce the
+/// pending-state / expired-lease predicates, so a stale snapshot can't
+/// steal a row that has since moved on.
+pub async fn claim_existing(
+    core: &AtomicCore,
+    run: &TaskRun,
+) -> Result<Option<RunHandle>, AtomicCoreError> {
+    let now = Utc::now();
+    let lease_until = now + ChronoDuration::from_std(LEASE_DURATION).unwrap();
+    let lease_until_str = iso(lease_until);
+    match try_claim(core, run, &iso(now), &lease_until_str).await? {
+        ClaimOutcome::Claimed(claimed) => Ok(Some(RunHandle::spawn(
+            core.clone(),
+            claimed,
+            lease_until_str,
+        ))),
+        ClaimOutcome::LostRace => Ok(None),
+    }
+}
+
 /// Whether a non-terminal row is runnable right now: pending rows need
 /// their `next_attempt_at` to be in the past, running rows need their
 /// `lease_until` to have expired. RFC3339 UTC strings compare

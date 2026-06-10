@@ -74,6 +74,7 @@ pub use providers::{ProviderConfig, ProviderType};
 pub use registry::{DatabaseInfo, OAuthCodeInfo, Registry};
 pub use search::{SearchMode, SearchOptions};
 pub use tokens::ApiTokenInfo;
+pub use wiki::runner::RegenOutcome;
 
 use chrono::Utc;
 use rusqlite::Connection;
@@ -1569,7 +1570,10 @@ impl AtomicCore {
         Ok((strategy, ctx))
     }
 
-    /// Generate a wiki article for a tag
+    /// Generate a wiki article for a tag. Pure mechanism: no ledger
+    /// interaction — callers that want durable retry, backoff, and per-tag
+    /// dedup should go through [`Self::regenerate_wiki`], which wraps this
+    /// in a `task_runs` row.
     pub async fn generate_wiki(
         &self,
         tag_id: &str,
@@ -1613,6 +1617,31 @@ impl AtomicCore {
 
         tracing::info!("[wiki] Article saved successfully");
         Ok(result)
+    }
+
+    /// Regenerate a tag's wiki article through the `task_runs` ledger: one
+    /// run per regeneration with `task_id = "wiki.regenerate"` and
+    /// `subject_id = <tag id>`. Returns [`RegenOutcome::Skipped`] when
+    /// another worker already holds the tag's run, or a failed regeneration
+    /// is still inside its backoff window. The tag name is resolved from
+    /// storage (a nonexistent tag is `NotFound`); see [`wiki::runner`] for
+    /// the full lifecycle.
+    pub async fn regenerate_wiki(
+        &self,
+        tag_id: &str,
+        trigger: TaskRunTrigger,
+    ) -> Result<RegenOutcome, AtomicCoreError> {
+        wiki::runner::run_wiki_regenerate(self, tag_id, trigger).await
+    }
+
+    /// Re-execute every runnable `wiki.regenerate` row (failed runs whose
+    /// backoff has elapsed, crashed runs with expired leases), returning the
+    /// tag ids whose articles were regenerated. Regeneration is
+    /// event-triggered — nothing on a schedule re-fires it — so the server's
+    /// scheduler tick drives this sweep; see
+    /// [`wiki::runner::sweep_due_wiki_regens`].
+    pub async fn sweep_due_wiki_regens(&self) -> Vec<String> {
+        wiki::runner::sweep_due_wiki_regens(self).await
     }
 
     /// Acquire the per-tag wiki lock. Serializes propose/accept/dismiss/update
@@ -7342,6 +7371,202 @@ mod tests {
         assert_eq!(history.len(), 1, "single run row — no double poll");
         assert_eq!(history[0].state, TaskRunState::Succeeded);
         assert_eq!(history[0].attempts, 1);
+    }
+
+    // ==================== Wiki regen via the ledger (phase 4) ====================
+    //
+    // Wiki regeneration rides `task_runs` with `task_id = "wiki.regenerate"`
+    // and the tag id as subject. Unlike system tasks and feed polls it is
+    // event-triggered — no schedule re-fires it — so on top of the shared
+    // claim semantics these tests pin the retry sweeper: a failed run's
+    // pending row is ignored while its backoff window is closed, picked up
+    // by `sweep_due_wiki_regens` once it opens (`force_retry_due` stands in
+    // for the elapsed wall clock), and settled quietly when its tag was
+    // deleted in the meantime. The HTTP-surface contract (409 on concurrent
+    // requests, distinct tags in parallel) lives in
+    // `atomic-server/tests/e2e_wiki.rs` across both backends.
+
+    use crate::wiki::runner::{RegenOutcome, WIKI_REGENERATE_TASK_ID};
+    use atomic_test_support::MockAiServer;
+
+    /// Point the per-DB provider settings at a mock OpenAI-compat server so
+    /// wiki generation drives the real provider client against
+    /// deterministic responses.
+    async fn seed_mock_provider(db: &AtomicCore, mock: &MockAiServer) {
+        for (k, v) in [
+            ("provider", "openai_compat"),
+            ("openai_compat_base_url", mock.base_url().as_str()),
+            ("openai_compat_api_key", "test-key"),
+            ("openai_compat_llm_model", "mock-llm"),
+        ] {
+            db.set_setting(k, v).await.unwrap();
+        }
+    }
+
+    /// Seed a tag with one atom and the chunk row the embedding pipeline
+    /// would have produced, so the wiki source query has content without
+    /// running the async pipeline.
+    async fn seed_wiki_tag(db: &AtomicCore, tag_name: &str) -> Tag {
+        let tag = db.create_tag(tag_name, None).await.unwrap();
+        let atom_id = uuid::Uuid::new_v4().to_string();
+        let request = CreateAtomRequest {
+            content: "wiki source content".to_string(),
+            tag_ids: vec![tag.id.clone()],
+            ..Default::default()
+        };
+        db.storage
+            .insert_atom_impl(&atom_id, &request, &Utc::now().to_rfc3339())
+            .await
+            .unwrap();
+        let sqlite = db.storage.as_sqlite().unwrap();
+        let conn = sqlite.db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO atom_chunks (id, atom_id, chunk_index, content) VALUES (?1, ?2, 0, ?3)",
+            rusqlite::params![
+                uuid::Uuid::new_v4().to_string(),
+                atom_id,
+                "wiki source content"
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        tag
+    }
+
+    #[tokio::test]
+    async fn wiki_regen_records_ledger_run_with_tag_subject() {
+        let (db, _temp) = create_test_db().await;
+        let mock = MockAiServer::start().await;
+        seed_mock_provider(&db, &mock).await;
+        let tag = seed_wiki_tag(&db, "Physics").await;
+
+        let outcome = db
+            .regenerate_wiki(&tag.id, TaskRunTrigger::Manual)
+            .await
+            .unwrap();
+        let RegenOutcome::Generated(article) = outcome else {
+            panic!("expected Generated, got {outcome:?}");
+        };
+
+        let history = db
+            .list_task_runs(WIKI_REGENERATE_TASK_ID, Some(&tag.id), 10)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1, "one ledger row per regeneration");
+        let run = &history[0];
+        assert_eq!(run.subject_id.as_deref(), Some(tag.id.as_str()));
+        assert_eq!(run.state, TaskRunState::Succeeded);
+        assert_eq!(run.trigger, TaskRunTrigger::Manual);
+        assert_eq!(
+            run.result_id.as_deref(),
+            Some(article.article.id.as_str()),
+            "result_id points at the produced article"
+        );
+        assert!(db.get_wiki(&tag.id).await.unwrap().is_some());
+
+        // A nonexistent tag is a caller error surfaced before any ledger
+        // row is created.
+        let err = db
+            .regenerate_wiki("missing-tag", TaskRunTrigger::Manual)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AtomicCoreError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn wiki_regen_failure_backs_off_and_sweeper_retries_when_window_opens() {
+        let (db, _temp) = create_test_db().await;
+        let mock = MockAiServer::start().await;
+        seed_mock_provider(&db, &mock).await;
+        // "WikiFail" in the tag name lands in the generation prompt and
+        // makes the mock provider 400 the call.
+        let tag = seed_wiki_tag(&db, "WikiFailPhysics").await;
+
+        let outcome = db
+            .regenerate_wiki(&tag.id, TaskRunTrigger::Manual)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, RegenOutcome::Failed { .. }));
+
+        let run = &db
+            .list_task_runs(WIKI_REGENERATE_TASK_ID, Some(&tag.id), 10)
+            .await
+            .unwrap()[0];
+        assert_eq!(run.state, TaskRunState::Pending, "retryable, not terminal");
+        assert_eq!(run.attempts, 1);
+        assert!(run.last_error.is_some());
+        assert!(
+            run.next_attempt_at.as_str() > Utc::now().to_rfc3339().as_str(),
+            "backoff pushed next_attempt_at into the future"
+        );
+
+        // NOT before the window opens: sweeps are no-ops and a manual
+        // request dedups against the backed-off row instead of double-running.
+        assert!(db.sweep_due_wiki_regens().await.is_empty());
+        let outcome = db
+            .regenerate_wiki(&tag.id, TaskRunTrigger::Manual)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, RegenOutcome::Skipped));
+        let history = db
+            .list_task_runs(WIKI_REGENERATE_TASK_ID, Some(&tag.id), 10)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1, "backed-off row reused, not duplicated");
+        assert_eq!(
+            history[0].attempts, 1,
+            "no re-attempt inside the backoff window"
+        );
+
+        // Open the window and clear the failure mode (rename the tag) — the
+        // sweep claims the row and the retry synthesizes against the tag's
+        // *current* name, not the one captured at enqueue time.
+        force_retry_due(&db, WIKI_REGENERATE_TASK_ID).await;
+        db.update_tag(&tag.id, "RecoveredPhysics", None)
+            .await
+            .unwrap();
+        let regenerated = db.sweep_due_wiki_regens().await;
+        assert_eq!(regenerated, vec![tag.id.clone()]);
+
+        let run = &db
+            .list_task_runs(WIKI_REGENERATE_TASK_ID, Some(&tag.id), 10)
+            .await
+            .unwrap()[0];
+        assert_eq!(run.state, TaskRunState::Succeeded);
+        assert_eq!(
+            run.attempts, 2,
+            "retry consumed a second attempt on the same row"
+        );
+        assert!(run.result_id.is_some());
+        assert!(db.get_wiki(&tag.id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn wiki_regen_sweep_settles_run_for_deleted_tag() {
+        let (db, _temp) = create_test_db().await;
+        let mock = MockAiServer::start().await;
+        seed_mock_provider(&db, &mock).await;
+        let tag = seed_wiki_tag(&db, "WikiFailDoomed").await;
+
+        let outcome = db
+            .regenerate_wiki(&tag.id, TaskRunTrigger::Manual)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, RegenOutcome::Failed { .. }));
+
+        // The tag disappears while its retry waits out the backoff. The
+        // sweep must settle the row (the work is moot, not failed) instead
+        // of leaving it runnable forever or recording a spurious abandon.
+        force_retry_due(&db, WIKI_REGENERATE_TASK_ID).await;
+        db.delete_tag(&tag.id, false).await.unwrap();
+
+        assert!(db.sweep_due_wiki_regens().await.is_empty());
+        let run = &db
+            .list_task_runs(WIKI_REGENERATE_TASK_ID, Some(&tag.id), 10)
+            .await
+            .unwrap()[0];
+        assert_eq!(run.state, TaskRunState::Succeeded);
+        assert!(run.result_id.is_none(), "no artifact for moot work");
     }
 
     // ==================== Reports primitive (V20) ====================

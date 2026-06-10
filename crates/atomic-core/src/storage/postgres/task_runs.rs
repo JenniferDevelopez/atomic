@@ -212,6 +212,32 @@ impl TaskRunStore for PostgresStorage {
         row.map(|r| row_to_task_run(&r)).transpose()
     }
 
+    async fn list_runnable_task_runs(
+        &self,
+        task_id: &str,
+        now: &str,
+    ) -> StorageResult<Vec<TaskRun>> {
+        let sql = format!(
+            "SELECT {COLS}
+             FROM task_runs
+             WHERE db_id = $1
+               AND task_id = $2
+               AND (
+                    (state = 'pending' AND next_attempt_at <= $3)
+                 OR (state = 'running' AND lease_until IS NOT NULL AND lease_until < $3)
+               )
+             ORDER BY next_attempt_at ASC"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(&self.db_id)
+            .bind(task_id)
+            .bind(now)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| AtomicCoreError::DatabaseOperation(e.to_string()))?;
+        rows.iter().map(row_to_task_run).collect()
+    }
+
     async fn find_active_task_run(
         &self,
         task_id: &str,

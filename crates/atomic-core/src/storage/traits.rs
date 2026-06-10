@@ -243,6 +243,9 @@ pub trait TagStore: Send + Sync {
         offset: i32,
     ) -> StorageResult<PaginatedTagChildren>;
 
+    /// Fetch a single tag by id. `None` when no tag with that id exists.
+    async fn get_tag(&self, id: &str) -> StorageResult<Option<Tag>>;
+
     /// Create a new tag.
     async fn create_tag(&self, name: &str, parent_id: Option<&str>) -> StorageResult<Tag>;
 
@@ -1049,6 +1052,18 @@ pub trait TaskRunStore: Send + Sync {
         subject_id: Option<&str>,
         now: &str,
     ) -> StorageResult<Option<crate::models::TaskRun>>;
+
+    /// Every runnable row for `task_id` across all subjects: `pending` rows
+    /// whose `next_attempt_at <= now` plus `running` rows whose lease has
+    /// expired (crash-recovery candidates). Earliest `next_attempt_at`
+    /// first. This is the sweep query for event-triggered tasks (wiki
+    /// regen): nothing on a schedule re-fires them, so a failed run's
+    /// backed-off retry has to be discovered by scanning the ledger itself.
+    async fn list_runnable_task_runs(
+        &self,
+        task_id: &str,
+        now: &str,
+    ) -> StorageResult<Vec<crate::models::TaskRun>>;
 
     /// Find any non-terminal row for `(task_id, subject_id)` regardless of
     /// timing — i.e., pending OR running, with `next_attempt_at` and

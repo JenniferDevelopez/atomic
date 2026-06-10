@@ -31,8 +31,21 @@ next interval), so retryable failures leave the feed due and the row's
 `next_attempt_at` drives backed-off retries. The hot due-feeds query is
 unchanged.
 
-Outstanding: phases 4–5 below, plus **wiki regen** (added to scope by
-`docs/plans/atomic-cloud.md` — currently fire-and-forget on tag change).
+Phase 4 is **landed**: wiki regeneration dispatches through the ledger as
+`task_id = "wiki.regenerate"` with `subject_id = <tag id>` (`wiki::runner`).
+Subject-keying gives per-tag dedup via the live-lease check — a second
+regen request for a tag with one in flight (or backing off after a
+failure) returns 409 from the route instead of double-running, while
+distinct tags regenerate concurrently. Because the trigger is
+event-driven (no schedule re-fires it), failed runs are retried by a
+**sweeper on the 15s scheduler tick**: `sweep_due_wiki_regens` scans the
+ledger for runnable `wiki.regenerate` rows (pending past
+`next_attempt_at`, or crashed with an expired lease) and re-executes
+them, resolving the tag's *current* name and settling rows whose tag was
+deleted in the meantime. There is no fast-path cache — the article row is
+the artifact and the hot `get_wiki` path never touches `task_runs`.
+
+Outstanding: phase 5 below (retention GC).
 Note `daily_briefing` no longer exists as a scheduled task — it collapsed
 into a seeded report (see `reports-phase-3-briefing-collapse.md`).
 
@@ -195,10 +208,12 @@ Each phase is independently shippable and testable.
    `feed_poll` runs with `subject_id`; demote
    `feeds.last_polled_at`/`last_error` to fast-path cache; poll loop
    claims/records.
-4. **Wiki regen.** Replace fire-and-forget regen on tag change with a
-   `task_runs` row (`task_id = "wiki.regenerate"`, `subject_id = <tag id>`).
+4. **Wiki regen.** ✅ Landed (as `wiki::runner`; see Status). Replace
+   fire-and-forget regen on tag change with a `task_runs` row
+   (`task_id = "wiki.regenerate"`, `subject_id = <tag id>`).
    Subject-keying gives natural per-tag dedup via the live-lease check;
-   retry/backoff replaces silent loss on LLM failure.
+   retry/backoff (driven by a sweep on the scheduler tick) replaces
+   silent loss on LLM failure.
 5. **Retention GC.** `task_runs_gc` scheduled task with the policy + batched deletes above.
 6. *(Follow-up, out of scope here)* Automations/recipes reuse the same ledger via `task_id = <automation id>` — no schema change expected.
 

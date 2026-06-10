@@ -189,6 +189,33 @@ impl SqliteStorage {
         Ok(row)
     }
 
+    /// Every runnable row for `task_id` across all subjects — the sweep
+    /// query for event-triggered tasks like wiki regen. Same runnability
+    /// predicate as [`Self::find_runnable_task_run_sync`], minus the
+    /// subject filter and the `LIMIT 1`.
+    pub(crate) fn list_runnable_task_runs_sync(
+        &self,
+        task_id: &str,
+        now: &str,
+    ) -> StorageResult<Vec<TaskRun>> {
+        let conn = self.db.read_conn()?;
+        let sql = format!(
+            "SELECT {COLS}
+             FROM task_runs
+             WHERE task_id = ?1
+               AND (
+                    (state = 'pending' AND next_attempt_at <= ?2)
+                 OR (state = 'running' AND lease_until IS NOT NULL AND lease_until < ?2)
+               )
+             ORDER BY next_attempt_at ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![task_id, now], row_to_task_run)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Find any non-terminal row for `(task_id, subject_id)` — pending OR
     /// running — regardless of timing. Most-recent first. Used by the
     /// scheduler to detect "this task already has work in flight" before
@@ -452,6 +479,19 @@ impl TaskRunStore for SqliteStorage {
         })
         .await
         .map_err(|e| AtomicCoreError::Lock(e.to_string()))?
+    }
+
+    async fn list_runnable_task_runs(
+        &self,
+        task_id: &str,
+        now: &str,
+    ) -> StorageResult<Vec<TaskRun>> {
+        let storage = self.clone();
+        let task_id = task_id.to_string();
+        let now = now.to_string();
+        tokio::task::spawn_blocking(move || storage.list_runnable_task_runs_sync(&task_id, &now))
+            .await
+            .map_err(|e| AtomicCoreError::Lock(e.to_string()))?
     }
 
     async fn find_active_task_run(
