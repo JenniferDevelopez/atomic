@@ -85,7 +85,13 @@ impl PgPoolConfig {
         let slow_query_threshold = std::env::var("ATOMIC_PG_SLOW_QUERY_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .map(|ms| if ms == 0 { None } else { Some(Duration::from_millis(ms)) })
+            .map(|ms| {
+                if ms == 0 {
+                    None
+                } else {
+                    Some(Duration::from_millis(ms))
+                }
+            })
             .unwrap_or(Some(Duration::from_millis(1000)));
         Self {
             max_connections: std::env::var("ATOMIC_PG_MAX_CONNECTIONS")
@@ -140,8 +146,8 @@ impl PostgresStorage {
         use sqlx::ConnectOptions;
         use std::str::FromStr;
 
-        let mut connect_opts = sqlx::postgres::PgConnectOptions::from_str(database_url)
-            .map_err(|e| {
+        let mut connect_opts =
+            sqlx::postgres::PgConnectOptions::from_str(database_url).map_err(|e| {
                 AtomicCoreError::DatabaseOperation(format!(
                     "Invalid Postgres connection URL: {}",
                     e
@@ -153,8 +159,7 @@ impl PostgresStorage {
         // useful in debug. Slow-query logging stays on (configurable below).
         connect_opts = connect_opts.log_statements(log::LevelFilter::Off);
         if let Some(threshold) = config.slow_query_threshold {
-            connect_opts =
-                connect_opts.log_slow_statements(log::LevelFilter::Warn, threshold);
+            connect_opts = connect_opts.log_slow_statements(log::LevelFilter::Warn, threshold);
         } else {
             connect_opts =
                 connect_opts.log_slow_statements(log::LevelFilter::Off, Duration::default());
@@ -229,10 +234,7 @@ impl PostgresStorage {
                 19,
                 include_str!("migrations/019_atom_chunks_hnsw_index.sql"),
             ),
-            (
-                20,
-                include_str!("migrations/020_atom_positions_double.sql"),
-            ),
+            (20, include_str!("migrations/020_atom_positions_double.sql")),
         ];
 
         // Advisory lock key — arbitrary fixed i64 to serialize migrations
@@ -266,19 +268,29 @@ impl PostgresStorage {
         &self,
         migrations: &[(i32, &str)],
     ) -> Result<(), AtomicCoreError> {
-        // Check if schema_version table exists
+        // Errors reading the current version must propagate, never default to
+        // 0: treating a failed read as "fresh database" re-runs every
+        // migration against an already-populated schema.
         let table_exists: bool = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name = 'schema_version')"
         )
         .fetch_one(&self.pool)
         .await
-        .unwrap_or(false);
+        .map_err(|e| {
+            AtomicCoreError::DatabaseOperation(format!("Schema version check failed: {e}"))
+        })?;
 
+        // `schema_version.version` is INTEGER (int4); the decode type must
+        // match exactly or sqlx's strict type check rejects the row.
         let current_version: i32 = if table_exists {
-            sqlx::query_scalar::<_, i64>("SELECT COALESCE(MAX(version), 0) FROM schema_version")
+            sqlx::query_scalar::<_, i32>("SELECT COALESCE(MAX(version), 0) FROM schema_version")
                 .fetch_one(&self.pool)
                 .await
-                .unwrap_or(0) as i32
+                .map_err(|e| {
+                    AtomicCoreError::DatabaseOperation(format!(
+                        "Reading schema_version failed: {e}"
+                    ))
+                })?
         } else {
             0
         };

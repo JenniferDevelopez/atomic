@@ -749,6 +749,38 @@ mod postgres_tests {
     pg_test!(pg_save_and_get_messages, test_save_and_get_messages);
     pg_test!(pg_delete_conversation, test_delete_conversation);
 
+    /// Re-initializing an already-migrated database must be a no-op. A
+    /// version-read failure (or type-mismatched decode) that silently
+    /// defaults to 0 re-runs every migration from 1, which appends duplicate
+    /// schema_version rows on every open — exactly what this guards against.
+    #[tokio::test]
+    async fn pg_initialize_reopen_runs_no_migrations() {
+        let Some(ref s) = postgres_storage().await else {
+            eprintln!("Skipping (ATOMIC_TEST_DATABASE_URL not set)");
+            return;
+        };
+        let url = std::env::var("ATOMIC_TEST_DATABASE_URL").unwrap();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        let count = |pool: sqlx::PgPool| async move {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM schema_version")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        };
+        let before = count(pool.clone()).await;
+        s.initialize().await.unwrap();
+        let after = count(pool).await;
+        assert_eq!(
+            before, after,
+            "initialize() on a migrated database re-ran migrations \
+             ({before} schema_version rows -> {after})"
+        );
+    }
+
     #[tokio::test]
     async fn pg_save_and_get_wiki() {
         let Some(ref s) = postgres_storage().await else {
